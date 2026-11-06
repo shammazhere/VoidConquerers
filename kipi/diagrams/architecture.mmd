@@ -1,0 +1,30 @@
+flowchart TD
+    CLI["kvdb CLI\ncmd/kvdb/main.go\nopen|put|get|del|batch|dump|check"] -->|calls| ENGINE
+    SERVE["kvdb serve\ncmd/kvdb/serve.go\nstdin protocol"] -->|calls| ENGINE
+    TORTURE["torture\ncmd/torture/\nkill+verify loop"] -->|spawns+kills| SERVE
+
+    subgraph ENGINE["Engine src/kvdb/"]
+        API["Public API db.go\nGet / Apply / Compact / Close\nRWMutex"]
+        WRITE["write.go Apply()\n1-validate 2-encode buf\n3-WriteAt 4-Sync 5-index 6-ACK"]
+        RECOVERY["recovery.go Open()\nPhase0-lock Phase1-header\nPhase2-rmTmp Phase3-scan+truncate"]
+        COMPACT["compact.go\n1-write.tmp 2-fsync.tmp\n3-rename 4-dir fsync 5-reopen"]
+        CHECK["check.go Check()\nread-only CRC scan"]
+        FORMAT["format.go\nCRC32C 16B header\n13B rec hdr + payload"]
+        PLATFORM["platform_*.go\nflock LockFileEx\ninstallCompacted"]
+    end
+
+    API --> WRITE & RECOVERY & COMPACT
+    WRITE & RECOVERY & COMPACT --> FORMAT
+    COMPACT & RECOVERY --> PLATFORM
+
+    subgraph DISK["Disk"]
+        DB["db.kv\nheader + records + markers"]
+        LOCK["db.kv.lock\nOS lock"]
+        TMP["db.kv.tmp\nonly during compaction"]
+    end
+
+    WRITE -->|"WriteAt + Sync"| DB
+    RECOVERY -->|"ReadAt + Truncate"| DB
+    COMPACT -->|"write→fsync→rename"| TMP & DB
+    PLATFORM -->|"lockFile"| LOCK
+
