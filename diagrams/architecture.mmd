@@ -1,0 +1,52 @@
+flowchart TD
+    subgraph ClientLayer ["Client & Ingestion Layer"]
+        API["Client API: put, get, del, batch, serve"]
+    end
+
+    subgraph ConcurrencyControl ["Concurrency & Synchronization"]
+        RwLock["RwLock (Process-Wide State)"]
+        StdoutMutex["Stdout Mutex (Serialized Output)"]
+        FLock["flock / LockFileEx (db.kv.lock)"]
+    end
+
+    subgraph WritePath ["Write Path (WriteLock Held)"]
+        W1["1. Check Poisoned State"] --> W2["2. Validate Request & Payload Sizes"]
+        W2 --> W3["3. Compute write_size = sum(rec) + 12"]
+        W3 --> W4{"4. Space Guard:<br/>file_size + write_size > max_bytes?"}
+        W4 -- "Yes (projected <= max)" --> Compactor["Compactor Triggered"]
+        W4 -- "Yes (projected > max)" --> ErrDiskFull["Return DISK_FULL"]
+        W4 -- "No" --> W5["5. Append Data Records (pwrite)"]
+        Compactor --> W5
+        W5 --> W6["6. BARRIER 1: fsync(fd)"]
+        W6 --> W7["7. Append Commit Marker (ValLen = N)"]
+        W7 --> W8["8. BARRIER 2: fsync(fd)"]
+        W8 --> W9["9. Update In-Memory Index + Counters"]
+        W9 --> W10["10. Print ACK op-id (stdout mutex)"]
+        W10 --> W11{"11. Auto-Compaction Check:<br/>reclaimable > max(64MB, live)?"}
+        W11 -- "Yes" --> RunAutoCompact["Trigger Background / Inline Compact"]
+        W11 -- "No" --> W12["12. Release Write Lock"]
+        RunAutoCompact --> W12
+    end
+
+    subgraph ReadPath ["Read Path (RwLock Read-Side)"]
+        R1["1. Index Lookup (Hash Index)"] --> R2{"Key Exists?"}
+        R2 -- "No" --> RNotFound["Return NOTFOUND"]
+        R2 -- "Yes" --> R3["2. pread(fd, offset, rec_size)"]
+        R3 --> R4["3. Verify CRC32C Checksum"]
+        R4 -- "Mismatch" --> RPoison["Report IO_ERROR / Corruption"]
+        R4 -- "Match" --> R5["4. Return Value Payload"]
+    end
+
+    subgraph StorageLayer ["Disk Storage & Files"]
+        MainFile["db.kv: [16B HEADER] [DATA RECORDS...] [12B MARKER]..."]
+        LockFile["db.kv.lock: Process Exclusive Advisory Lock"]
+        TmpFile["db.kv.tmp: Atomic Replacement File (Compaction/Creation)"]
+    end
+
+    API -->|Write Requests| W1
+    API -->|Read Requests| R1
+    W10 -.-> StdoutMutex
+    MainFile <--> W5
+    MainFile <--> W7
+    MainFile <--> R3
+
