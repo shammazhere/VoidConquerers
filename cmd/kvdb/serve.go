@@ -42,12 +42,12 @@ func mapErrorCode(err error) string {
 }
 
 func runServe(args []string, stdin io.Reader, stdout io.Writer) error {
-	flags, pos, err := parseArgs(args, "max-bytes", "step-delay-us")
+	flags, pos, err := parseArgs(args, "max-bytes", "step-delay-us", "crash-at")
 	if err != nil {
 		return err
 	}
 	if len(pos) != 1 {
-		return errors.New("usage: kvdb serve <path> [--max-bytes N] [--step-delay-us N]")
+		return errors.New("usage: kvdb serve <path> [--max-bytes N] [--step-delay-us N] [--crash-at CPn]")
 	}
 	maxBytes, err := flagInt64(flags, "max-bytes")
 	if err != nil {
@@ -62,11 +62,16 @@ func runServe(args []string, stdin io.Reader, stdout io.Writer) error {
 		return errors.New("option --step-delay-us is too large")
 	}
 
-	db, err := kvdb.Open(pos[0], kvdb.Options{MaxBytes: maxBytes})
+	stepDelay := time.Duration(stepDelayUs) * time.Microsecond
+	db, err := kvdb.Open(pos[0], kvdb.Options{
+		MaxBytes:  maxBytes,
+		StepDelay: stepDelay,
+		CrashAt:   flags["crash-at"],
+	})
 	if err != nil {
 		return err
 	}
-	serveErr := serveLoop(db, bufio.NewReaderSize(stdin, 64*1024), bufio.NewWriter(stdout), time.Duration(stepDelayUs)*time.Microsecond)
+	serveErr := serveLoop(db, bufio.NewReaderSize(stdin, 64*1024), bufio.NewWriter(stdout), stepDelay)
 	closeErr := db.Close()
 	if serveErr != nil {
 		return serveErr
@@ -216,10 +221,14 @@ func serveHPUT(db *kvdb.DB, writer *bufio.Writer, opID, args string) error {
 			return writeReply(writer, "ERR %s BAD_REQUEST\n", opID)
 		}
 	}
-	if err := db.Put(key, val); err != nil {
+	var ackErr error
+	err = db.Apply([]kvdb.Op{{Key: key, Value: val}}, func() {
+		ackErr = writeReply(writer, "ACK %s\n", opID)
+	})
+	if err != nil {
 		return writeReply(writer, "ERR %s %s\n", opID, mapErrorCode(err))
 	}
-	return writeReply(writer, "ACK %s\n", opID)
+	return ackErr
 }
 
 func serveHDEL(db *kvdb.DB, writer *bufio.Writer, opID, args string) error {
@@ -231,10 +240,14 @@ func serveHDEL(db *kvdb.DB, writer *bufio.Writer, opID, args string) error {
 	if err != nil {
 		return writeReply(writer, "ERR %s BAD_REQUEST\n", opID)
 	}
-	if err := db.Delete(key); err != nil {
+	var ackErr error
+	err = db.Apply([]kvdb.Op{{Del: true, Key: key}}, func() {
+		ackErr = writeReply(writer, "ACK %s\n", opID)
+	})
+	if err != nil {
 		return writeReply(writer, "ERR %s %s\n", opID, mapErrorCode(err))
 	}
-	return writeReply(writer, "ACK %s\n", opID)
+	return ackErr
 }
 
 func serveHGET(db *kvdb.DB, writer *bufio.Writer, opID, args string) error {
@@ -246,9 +259,9 @@ func serveHGET(db *kvdb.DB, writer *bufio.Writer, opID, args string) error {
 	if err != nil {
 		return writeReply(writer, "ERR %s BAD_REQUEST\n", opID)
 	}
-	val, err := db.Get(key)
+	val, found, err := db.Get(key)
 	switch {
-	case errors.Is(err, kvdb.ErrNotFound):
+	case !found:
 		return writeReply(writer, "NOTFOUND %s\n", opID)
 	case err != nil:
 		return writeReply(writer, "ERR %s %s\n", opID, mapErrorCode(err))
@@ -312,10 +325,14 @@ func serveHBATCH(db *kvdb.DB, reader *bufio.Reader, writer *bufio.Writer, opID, 
 		}
 		return nil, false
 	}
-	if err := db.Apply(ops); err != nil {
+	var ackErr error
+	err = db.Apply(ops, func() {
+		ackErr = writeReply(writer, "ACK %s\n", opID)
+	})
+	if err != nil {
 		return writeReply(writer, "ERR %s %s\n", opID, mapErrorCode(err)), eof
 	}
-	return writeReply(writer, "ACK %s\n", opID), eof
+	return ackErr, eof
 }
 
 func parseHexBatchOperation(line string) (kvdb.Op, error) {
@@ -341,7 +358,7 @@ func parseHexBatchOperation(line string) (kvdb.Op, error) {
 				return kvdb.Op{}, fmt.Errorf("invalid hex val: %w", err)
 			}
 		}
-		return kvdb.Op{Type: kvdb.OpPut, Key: key, Value: val}, nil
+		return kvdb.Op{Del: false, Type: kvdb.OpPut, Key: key, Value: val}, nil
 
 	case "HDEL":
 		kHex, rest, ok := takeField(rest)
@@ -352,7 +369,7 @@ func parseHexBatchOperation(line string) (kvdb.Op, error) {
 		if err != nil {
 			return kvdb.Op{}, fmt.Errorf("invalid hex key: %w", err)
 		}
-		return kvdb.Op{Type: kvdb.OpDelete, Key: key}, nil
+		return kvdb.Op{Del: true, Type: kvdb.OpDelete, Key: key}, nil
 
 	default:
 		return parseBatchOperation(line)
@@ -362,37 +379,45 @@ func parseHexBatchOperation(line string) (kvdb.Op, error) {
 func servePut(db *kvdb.DB, writer *bufio.Writer, opID, args string) error {
 	key, value, ok := takeField(args)
 	if !ok || len(value) == 0 {
-		return writeReply(writer, "ERR %s put requires a key and value\n", opID)
+		return writeReply(writer, "ERR %s BAD_REQUEST\n", opID)
 	}
 	value = strings.TrimLeft(value, " \t")
-	if err := db.Put([]byte(key), []byte(value)); err != nil {
-		return writeReply(writer, "ERR %s %v\n", opID, err)
+	var ackErr error
+	err := db.Apply([]kvdb.Op{{Key: []byte(key), Value: []byte(value)}}, func() {
+		ackErr = writeReply(writer, "ACK %s\n", opID)
+	})
+	if err != nil {
+		return writeReply(writer, "ERR %s %s\n", opID, mapErrorCode(err))
 	}
-	return writeReply(writer, "ACK %s\n", opID)
+	return ackErr
 }
 
 func serveDelete(db *kvdb.DB, writer *bufio.Writer, opID, args string) error {
 	key, rest, ok := takeField(args)
 	if !ok || strings.TrimSpace(rest) != "" {
-		return writeReply(writer, "ERR %s del requires exactly one key\n", opID)
+		return writeReply(writer, "ERR %s BAD_REQUEST\n", opID)
 	}
-	if err := db.Delete([]byte(key)); err != nil {
-		return writeReply(writer, "ERR %s %v\n", opID, err)
+	var ackErr error
+	err := db.Apply([]kvdb.Op{{Del: true, Key: []byte(key)}}, func() {
+		ackErr = writeReply(writer, "ACK %s\n", opID)
+	})
+	if err != nil {
+		return writeReply(writer, "ERR %s %s\n", opID, mapErrorCode(err))
 	}
-	return writeReply(writer, "ACK %s\n", opID)
+	return ackErr
 }
 
 func serveGet(db *kvdb.DB, writer *bufio.Writer, opID, args string) error {
 	key, rest, ok := takeField(args)
 	if !ok || strings.TrimSpace(rest) != "" {
-		return writeReply(writer, "ERR %s get requires exactly one key\n", opID)
+		return writeReply(writer, "ERR %s BAD_REQUEST\n", opID)
 	}
-	value, err := db.Get([]byte(key))
+	value, found, err := db.Get([]byte(key))
 	switch {
-	case errors.Is(err, kvdb.ErrNotFound):
+	case !found:
 		return writeReply(writer, "NOTFOUND %s\n", opID)
 	case err != nil:
-		return writeReply(writer, "ERR %s %v\n", opID, err)
+		return writeReply(writer, "ERR %s %s\n", opID, mapErrorCode(err))
 	default:
 		return writeReply(writer, "VAL %s %s\n", opID, value)
 	}
@@ -401,10 +426,10 @@ func serveGet(db *kvdb.DB, writer *bufio.Writer, opID, args string) error {
 func serveBatch(db *kvdb.DB, reader *bufio.Reader, writer *bufio.Writer, opID, args string, eof bool) (error, bool) {
 	count, err := strconv.Atoi(strings.TrimSpace(args))
 	if err != nil || count < 0 {
-		return writeReply(writer, "ERR %s batch requires a non-negative count\n", opID), eof
+		return writeReply(writer, "ERR %s BAD_REQUEST\n", opID), eof
 	}
 	if count > kvdb.MaxBatchOps {
-		writeErr := writeReply(writer, "ERR %s batch exceeds the %d operation limit\n", opID, kvdb.MaxBatchOps)
+		writeErr := writeReply(writer, "ERR %s BAD_REQUEST\n", opID)
 		if writeErr != nil {
 			return writeErr, eof
 		}
@@ -453,10 +478,14 @@ func serveBatch(db *kvdb.DB, reader *bufio.Reader, writer *bufio.Writer, opID, a
 		}
 		return nil, false
 	}
-	if err := db.Apply(ops); err != nil {
-		return writeReply(writer, "ERR %s %v\n", opID, err), eof
+	var ackErr error
+	err = db.Apply(ops, func() {
+		ackErr = writeReply(writer, "ACK %s\n", opID)
+	})
+	if err != nil {
+		return writeReply(writer, "ERR %s %s\n", opID, mapErrorCode(err)), eof
 	}
-	return writeReply(writer, "ACK %s\n", opID), eof
+	return ackErr, eof
 }
 
 func serveDump(db *kvdb.DB, writer *bufio.Writer, opID string) error {

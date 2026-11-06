@@ -1,120 +1,84 @@
-// check.go — read-only integrity verification for `./kvdb check`.
-
 package kvdb
 
 import (
-	"encoding/binary"
 	"fmt"
 	"os"
 )
 
-// CheckResult is returned by Check.
-type CheckResult struct {
-	OK            bool
-	KeyCount      int
-	UncommittedBytes int64 // bytes in uncommitted tail (not necessarily an error)
-	Message       string
+// CheckReport is the result of Check.
+type CheckReport struct {
+	OK             bool
+	Reason         string // why the file is not OK
+	Keys           int
+	FileBytes      int64
+	CommittedBytes int64  // end of the last valid commit marker
+	TailBytes      int64  // bytes after it: an uncommitted or torn tail the next open() will cut
+	TailReason     string // why the scan stopped there
+	Records        int
+	Commits        int
+	TmpExists      bool // a leftover db.tmp the next open() will delete
 }
 
-// Check opens the file at path read-only and verifies its integrity.
-// It does NOT acquire a write lock (read-only).
-func Check(path string) (*CheckResult, error) {
+// Check verifies a database file without changing it (no lock, no repair).
+//
+// It runs the same scan as recovery and then re-reads every record the
+// index points at, verifying CRC, flags and key. A file is OK if it is a
+// state this database can produce: a valid header, a chain of valid
+// committed records, and optionally an uncommitted/torn tail (which is what
+// a kill leaves behind and what the next open() truncates).
+func Check(path string) CheckReport {
+	var rep CheckReport
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		rep.Reason = fmt.Sprintf("cannot open: %v", err)
+		return rep
 	}
 	defer f.Close()
 
-	fi, err := f.Stat()
+	index := make(map[string]entry)
+	res, err := scan(f, func(del bool, key string, e entry) {
+		if del {
+			delete(index, key)
+		} else {
+			index[key] = e
+		}
+	})
 	if err != nil {
-		return nil, err
+		rep.Reason = err.Error()
+		return rep
 	}
-	fileSize := fi.Size()
-
-	if fileSize == 0 {
-		return &CheckResult{OK: false, Message: "file is empty"}, nil
-	}
-
-	// Validate header
-	hdrBuf := make([]byte, FileHeaderSize)
-	if _, err := f.ReadAt(hdrBuf, 0); err != nil {
-		return &CheckResult{OK: false, Message: "cannot read header"}, nil
-	}
-	if !verifyFileHeader(hdrBuf) {
-		return &CheckResult{OK: false, Message: "invalid file header (not a KIPI file)"}, nil
+	rep.FileBytes = res.size
+	rep.CommittedBytes = res.lastSafe
+	rep.TailBytes = res.size - res.lastSafe
+	rep.Records = res.records
+	rep.Commits = res.commits
+	if rep.TailBytes > 0 {
+		rep.TailReason = res.stopReason
 	}
 
-	// Scan records
-	pos := int64(FileHeaderSize)
-	validEnd := int64(FileHeaderSize)
-	keysSeen := make(map[string]bool)
-	hdr := make([]byte, RecHeaderSize)
-	batchOpen := false
-
-	for pos+int64(RecHeaderSize) <= fileSize {
-		if _, err := f.ReadAt(hdr, pos); err != nil {
-			break
+	var rec []byte
+	for k, e := range index {
+		if e.off < HeaderSize || e.off+int64(e.recSize) > res.lastSafe {
+			rep.Reason = fmt.Sprintf("index entry for key %q points outside the committed region", k)
+			return rep
 		}
-		rtype := hdr[0]
-		keyLen := binary.LittleEndian.Uint32(hdr[1:5])
-		valLen := binary.LittleEndian.Uint32(hdr[5:9])
-		storedCRC := binary.LittleEndian.Uint32(hdr[9:13])
-
-		if keyLen > MaxKeyLen || valLen > MaxValLen {
-			break
+		if cap(rec) < int(e.recSize) {
+			rec = make([]byte, e.recSize)
 		}
-		totalPayload := int64(keyLen) + int64(valLen)
-		if pos+int64(RecHeaderSize)+totalPayload > fileSize {
-			break
+		rec = rec[:e.recSize]
+		if _, err := f.ReadAt(rec, e.off); err != nil {
+			rep.Reason = fmt.Sprintf("read record at %d: %v", e.off, err)
+			return rep
 		}
-
-		payload := make([]byte, totalPayload)
-		if totalPayload > 0 {
-			if _, err := f.ReadAt(payload, pos+int64(RecHeaderSize)); err != nil {
-				break
-			}
+		if _, err := verifyPut(rec, k); err != nil {
+			rep.Reason = fmt.Sprintf("record for key %q at offset %d failed verification", k, e.off)
+			return rep
 		}
-		key := payload[:keyLen]
-		val := payload[keyLen:]
-
-		if !verifyRecord(rtype, key, val, storedCRC) {
-			break
-		}
-
-		recEnd := pos + int64(RecHeaderSize) + totalPayload
-
-		switch rtype {
-		case typeRecord:
-			keysSeen[string(key)] = true
-			batchOpen = true
-		case typeDelete:
-			delete(keysSeen, string(key))
-			batchOpen = true
-		case typeMarker:
-			validEnd = recEnd
-			batchOpen = false
-		default:
-			break
-		}
-
-		pos = recEnd
 	}
-
-	uncommittedBytes := fileSize - validEnd
-	if batchOpen {
-		// There are uncommitted records in the tail — this is a torn tail.
-		return &CheckResult{
-			OK:               true, // recoverable
-			KeyCount:         len(keysSeen),
-			UncommittedBytes: uncommittedBytes,
-			Message: fmt.Sprintf("OK (uncommitted tail: %d bytes; will be truncated on open)", uncommittedBytes),
-		}, nil
+	rep.Keys = len(index)
+	if _, err := os.Stat(path + ".tmp"); err == nil {
+		rep.TmpExists = true
 	}
-
-	return &CheckResult{
-		OK:       true,
-		KeyCount: len(keysSeen),
-		Message:  "OK",
-	}, nil
+	rep.OK = true
+	return rep
 }
-

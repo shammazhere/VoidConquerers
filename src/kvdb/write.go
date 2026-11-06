@@ -1,192 +1,308 @@
-// write.go — Apply: the single write path implementing steps 1-12.
-//
-// Crash points CP1-CP7 are documented inline.
-//
-// Write ordering for a batch:
-//   1. Validate inputs (key/value length limits, disk-full guard)
-//   2. For each op: append record bytes to buffer
-//   3. Append commit marker to buffer
-//   4. Write entire buffer to file (single write syscall where possible)
-//   5. fsync (barrier 1) — CP5: killed here, marker MAY be on disk; recovery handles it
-//   6. Update in-memory index
-//   7. ACK to caller
-//   8. Auto-compact if needed
-
 package kvdb
 
 import (
-	"encoding/binary"
-	"errors"
 	"fmt"
+	"os"
 )
 
-const (
-	MaxKeyLen   = 1024
-	MaxValLen   = 1024 * 1024 // 1 MB
-	MaxBatchOps = 10000
-)
+// writeChunk is the largest single write() we issue. Big records (1 MB
+// values, 10,000-op batches) are written in several pieces, so a kill can
+// genuinely land in the middle of a record (scenarios A2, A7, B1, B6).
+const writeChunk = 256 << 10
 
-// Op is a single operation in a batch.
-type Op struct {
-	Type  OpType
-	Key   []byte
-	Value []byte
+// Put stores value under key.
+func (db *DB) Put(key, value []byte) error {
+	return db.Apply([]Op{{Key: key, Value: value}})
 }
 
-// OpType distinguishes puts from deletes.
-type OpType uint8
+// Delete removes key. Deleting a missing key is not an error.
+func (db *DB) Delete(key []byte) error {
+	return db.Apply([]Op{{Del: true, Key: key}})
+}
 
-const (
-	OpPut    OpType = 1
-	OpDelete OpType = 2
-)
+// Batch applies ops atomically, in listed order. For a repeated key the last
+// op wins (put X, del X -> X absent; del X, put X -> X present).
+func (db *DB) Batch(ops []Op) error { return db.Apply(ops) }
 
-// Apply atomically applies one or more operations.
-// This is the single write path. CP1-CP7 are crash points.
-//
-// Step 1: validate
-// Step 2: disk-full guard
-// Step 3: encode all records + marker into one buffer
-// Step 4: write buffer to file
-// Step 5: fsync (barrier — CP5: if killed here marker may be on disk)
-// Step 6: update index
-// Step 7: return nil (ACK happens in caller)
-func (db *DB) Apply(ops []Op) error {
-	if len(ops) == 0 {
-		return nil
+func validate(ops []Op) error {
+	if len(ops) == 0 || len(ops) > MaxBatchOps {
+		return fmt.Errorf("%w: batch must have 1..%d ops, got %d", ErrBadRequest, MaxBatchOps, len(ops))
 	}
-	if len(ops) > MaxBatchOps {
-		return fmt.Errorf("kvdb: batch too large: %d ops (max %d)", len(ops), MaxBatchOps)
+	for _, op := range ops {
+		if len(op.Key) < 1 || len(op.Key) > MaxKeyLen {
+			return fmt.Errorf("%w: key length %d not in 1..%d", ErrBadRequest, len(op.Key), MaxKeyLen)
+		}
+		if op.IsDel() && len(op.Value) != 0 {
+			return fmt.Errorf("%w: delete with a value", ErrBadRequest)
+		}
+		if len(op.Value) > MaxValLen {
+			return fmt.Errorf("%w: value length %d > %d", ErrBadRequest, len(op.Value), MaxValLen)
+		}
+	}
+	return nil
+}
+
+func recSizeOf(op Op) int64 {
+	if op.IsDel() {
+		return int64(RecHdrSize + len(op.Key))
+	}
+	return int64(RecHdrSize + len(op.Key) + len(op.Value))
+}
+
+// Apply is the single write path used by Put, Delete and Batch. A single put
+// is a batch of one. onCommit, if not nil, runs after the commit is durable
+// and the index is updated, while the write lock is still held: serve prints
+// its ACK there, so ACK lines come out in commit order.
+//
+// Step numbers match ARCHITECTURE.md section 5 and the diagram.
+func (db *DB) Apply(ops []Op, onCommit ...func()) error {
+	// Step 2: validate. Nothing is written for a bad request.
+	if err := validate(ops); err != nil {
+		return err
+	}
+
+	var cb func()
+	if len(onCommit) > 0 {
+		cb = onCommit[0]
 	}
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
+	// Step 1: reject if closed or poisoned.
 	if db.closed {
-		return errors.New("kvdb: db is closed")
+		return ErrClosed
 	}
-	if db.poisoned {
-		return ErrPoisoned
+	if db.poisoned || db.f == nil {
+		return fmt.Errorf("%w: database is poisoned after an earlier I/O failure; restart to recover", ErrIO)
 	}
 
-	// Step 1: Validate all ops before touching the file (CP1: nothing on disk yet)
+	// Step 3: write_size = all data records + one 12-byte marker.
+	var writeSize int64
+	hasPut := false
 	for _, op := range ops {
-		if len(op.Key) == 0 || len(op.Key) > MaxKeyLen {
-			return fmt.Errorf("kvdb: key length %d out of range [1,%d]", len(op.Key), MaxKeyLen)
-		}
-		if op.Type == OpPut && len(op.Value) > MaxValLen {
-			return fmt.Errorf("kvdb: value length %d exceeds max %d", len(op.Value), MaxValLen)
+		writeSize += recSizeOf(op)
+		if !op.IsDel() {
+			hasPut = true
 		}
 	}
+	writeSize += RecHdrSize
 
-	// Step 2: Estimate required bytes and check against limit
-	needed := int64(0)
-	for _, op := range ops {
-		needed += int64(RecHeaderSize) + int64(len(op.Key))
-		if op.Type == OpPut {
-			needed += int64(len(op.Value))
-		}
-	}
-	needed += int64(RecHeaderSize) + 8 // commit marker: keyLen=8, valLen=0
-
-	// CP2: nothing written yet
-	if db.opts.MaxBytes > 0 && db.fileSize+needed > db.opts.MaxBytes {
-		return ErrDiskFull
+	// Step 4: space guard. May run compaction. Returns DISK_FULL before a
+	// single byte is written, so a rejected batch leaves the file untouched
+	// (E1, E2, E3).
+	if err := db.spaceGuard(writeSize, hasPut); err != nil {
+		return err
 	}
 
-	// Step 3: Encode all records + marker into one buffer
-	batchID := db.nextBatchID
-	db.nextBatchID++
+	start := db.fileSize
+	if sabotage == "ack-before-fsync" && cb != nil { // planted bug, dead code in normal builds
+		cb()
+		cb = nil
+	}
+	// CP1 - CRASH HERE: nothing of this commit is in the file yet. The file
+	// ends at db.fileSize on a committed marker. Next open(): scans to the
+	// same end, truncates nothing, the op is absent (A1).
+	db.crashPoint("CP1")
 
-	buf := make([]byte, 0, int(needed))
-	offsets := make([]int64, len(ops)) // file offsets of each record
-	curOffset := db.fileSize
+	// Step 5: append the data records at the explicit offset `start`
+	// (pwrite), never with O_APPEND, so a failed write cannot shift anything.
+	offs, err := db.appendRecords(start, ops)
+	if err != nil {
+		db.rollback(start)
+		return fmt.Errorf("%w: write: %v", ErrIO, err)
+	}
+	db.pause()
+	// CP3 - CRASH HERE: all data records are in the page cache, not fsynced,
+	// no marker. Next open(): the scan stages them, reaches EOF without a
+	// marker, discards them and truncates to `start` (A3, B2).
+	db.crashPoint("CP3")
 
+	// Step 6: BARRIER 1. After this the data records are on disk.
+	if err := db.f.Sync(); err != nil {
+		// Never retry a failed fsync: the kernel may have dropped the dirty
+		// pages and a retry can falsely succeed. Poison and let recovery decide.
+		db.poison()
+		return fmt.Errorf("%w: fsync 1: %v", ErrIO, err)
+	}
+	db.pause()
+	// CP4 - CRASH HERE: data records durable, marker not written. Next
+	// open(): same as CP3, the batch is discarded, file truncated to `start`.
+	db.crashPoint("CP4")
+
+	// Step 7: append the commit marker (ValLen = number of data records).
+	markerOff := start + writeSize - RecHdrSize
+	if err := writeAtChunked(db.f, encodeMarker(len(ops)), markerOff); err != nil {
+		db.rollback(start)
+		return fmt.Errorf("%w: write marker: %v", ErrIO, err)
+	}
+	db.pause()
+	// CP5 - CRASH HERE: marker is in the page cache, not fsynced. A process
+	// kill cannot lose page-cache bytes, so the marker is complete and the
+	// next open() commits the batch; if it were torn, its CRC fails and the
+	// batch is discarded. Either way all-or-nothing (A3, B3).
+	db.crashPoint("CP5")
+
+	// Step 8: BARRIER 2. After this the commit is durable.
+	if err := db.f.Sync(); err != nil {
+		db.poison()
+		return fmt.Errorf("%w: fsync 2: %v", ErrIO, err)
+	}
+	db.pause()
+	// CP6 - CRASH HERE: commit durable, index not updated, no ACK sent. Next
+	// open(): finds the valid marker, applies the batch. The data is present
+	// although the caller never heard back (A4).
+	db.crashPoint("CP6")
+
+	// Step 9: update the in-memory index, ops in listed order (last op wins).
+	db.fileSize = start + writeSize
 	for i, op := range ops {
-		offsets[i] = curOffset
-		switch op.Type {
-		case OpPut:
-			buf = appendRecord(buf, typeRecord, op.Key, op.Value)
-		case OpDelete:
-			buf = appendRecord(buf, typeDelete, op.Key, nil)
-		}
-		curOffset += int64(RecHeaderSize) + int64(len(op.Key))
-		if op.Type == OpPut {
-			curOffset += int64(len(op.Value))
-		}
+		e := entry{off: offs[i], recSize: uint32(recSizeOf(op)), vlen: uint32(len(op.Value))}
+		db.applyToIndex(op.IsDel(), string(op.Key), e)
 	}
-	// Append commit marker
-	markerBytes := encodeMarker(batchID)
-	buf = append(buf, markerBytes...)
 
-	// Step 4: Write to file (CP3: some bytes written, no marker yet)
-	// CP4: all records written, marker not yet
-	n, err := db.file.WriteAt(buf, db.fileSize)
-	if err != nil || n != len(buf) {
-		// Rollback: truncate to original size
-		db.rollback(db.fileSize)
-		if err != nil {
-			return fmt.Errorf("kvdb: write error: %w", err)
-		}
-		return fmt.Errorf("kvdb: short write: wrote %d of %d bytes", n, len(buf))
+	// Step 10: ACK, still under the write lock.
+	if cb != nil {
+		cb()
 	}
-	// CP3/CP4 handled: if killed here, marker is not fsynced; recovery will truncate.
+	// CP7 - CRASH HERE: ACK sent. Same disk state as CP6: present (A5).
+	db.crashPoint("CP7")
 
-	// Step 5: fsync — barrier 1 (CP5: killed during fsync)
-	// After fsync returns, all bytes including the marker are on disk.
-	if err := db.file.Sync(); err != nil {
-		db.rollback(db.fileSize)
-		return fmt.Errorf("kvdb: fsync error: %w", err)
+	// Step 11: automatic compaction. Its failure does not change this
+	// commit's result: the commit is already durable and acknowledged.
+	db.maybeAutoCompact()
+	return nil
+	// Step 12: the deferred Unlock releases the write lock.
+}
+
+// applyToIndex applies one op to the index and keeps liveBytes exact.
+// Recovery uses the same function, so replay == the original write.
+func (db *DB) applyToIndex(del bool, key string, e entry) {
+	if old, ok := db.index[key]; ok {
+		db.liveBytes -= int64(old.recSize)
 	}
-	// CP6: fsync returned, we have not updated index yet.
-	// Recovery: marker is on disk → batch will be replayed. Correct.
+	if del {
+		delete(db.index, key)
+		return
+	}
+	db.index[key] = e
+	db.liveBytes += int64(e.recSize)
+}
 
-	// Step 6: Update in-memory index (atomic from Go's perspective under write lock)
-	newFileSize := db.fileSize + int64(len(buf))
+// appendRecords encodes the data records of ops and writes them starting at
+// `start`. It returns the offset of each record.
+func (db *DB) appendRecords(start int64, ops []Op) ([]int64, error) {
+	offs := make([]int64, len(ops))
+	buf := make([]byte, 0, writeChunk+RecHdrSize+MaxKeyLen)
+	bufStart := start
+	pos := start
 	for i, op := range ops {
-		switch op.Type {
-		case OpPut:
-			db.index[string(op.Key)] = indexEntry{
-				offset: offsets[i],
-				keyLen: uint32(len(op.Key)),
-				valLen: uint32(len(op.Value)),
+		offs[i] = pos
+		if op.IsDel() {
+			buf = appendRecord(buf, FlagDel|FlagBatch, op.Key, nil)
+		} else {
+			buf = appendRecord(buf, FlagPut|FlagBatch, op.Key, op.Value)
+		}
+		pos += recSizeOf(op)
+		if len(buf) >= writeChunk {
+			// CP2 - CRASH HERE (any iteration): a prefix of this batch is in
+			// the file, possibly ending in the middle of a record. Next
+			// open(): the torn record fails its length/EOF or CRC check, the
+			// whole uncommitted run is discarded and the file is truncated to
+			// `start` (A2, A7, B1, B6).
+			if err := writeAtChunked(db.f, buf, bufStart); err != nil {
+				return nil, err
 			}
-			db.liveBytes += int64(RecHeaderSize) + int64(len(op.Key)) + int64(len(op.Value))
-		case OpDelete:
-			if _, existed := db.index[string(op.Key)]; existed {
-				old := db.index[string(op.Key)]
-				db.liveBytes -= int64(RecHeaderSize) + int64(old.keyLen) + int64(old.valLen)
-			}
-			delete(db.index, string(op.Key))
+			db.crashPoint("CP2") // a prefix of the batch is now in the file
+			db.pause()
+			bufStart += int64(len(buf))
+			buf = buf[:0]
 		}
 	}
-	db.fileSize = newFileSize
-	// CP7: index updated. ACK will be returned.
+	if len(buf) > 0 {
+		if err := writeAtChunked(db.f, buf, bufStart); err != nil {
+			return nil, err
+		}
+	}
+	return offs, nil
+}
 
+// writeAtChunked writes b at off in pieces of at most writeChunk bytes.
+func writeAtChunked(f *os.File, b []byte, off int64) error {
+	for len(b) > 0 {
+		n := len(b)
+		if n > writeChunk {
+			n = writeChunk
+		}
+		if _, err := f.WriteAt(b[:n], off); err != nil {
+			return err
+		}
+		b = b[n:]
+		off += int64(n)
+	}
 	return nil
 }
 
-// Put is a convenience wrapper for a single put.
-func (db *DB) Put(key, value []byte) error {
-	return db.Apply([]Op{{Type: OpPut, Key: key, Value: value}})
+// rollback removes the partial bytes of a failed commit: ftruncate back to
+// the last committed end, then fsync. If either fails we poison, because the
+// file may now hold garbage after the committed end and the next append must
+// not land behind it.
+func (db *DB) rollback(start int64) {
+	if err := db.f.Truncate(start); err != nil {
+		db.poison()
+		return
+	}
+	if err := db.f.Sync(); err != nil {
+		db.poison()
+	}
 }
 
-// Delete is a convenience wrapper for a single delete.
-func (db *DB) Delete(key []byte) error {
-	return db.Apply([]Op{{Type: OpDelete, Key: key}})
+// reserve is the part of MaxBytes that only delete-only batches may use.
+func (db *DB) reserve() int64 { return db.opts.MaxBytes / 8 }
+
+// spaceGuard implements step 4. The limit is MaxBytes for delete-only
+// batches and MaxBytes-reserve for batches containing a put.
+func (db *DB) spaceGuard(writeSize int64, hasPut bool) error {
+	if db.opts.MaxBytes <= 0 {
+		return nil
+	}
+	limit := db.opts.MaxBytes
+	if hasPut {
+		limit -= db.reserve()
+	}
+	if db.fileSize+writeSize <= limit {
+		return nil
+	}
+	// projected = file size right after a compaction: header + live records + one marker.
+	projected := int64(HeaderSize) + db.liveBytes + RecHdrSize
+	if projected+writeSize > limit {
+		return fmt.Errorf("%w: write of %d bytes does not fit in max_bytes=%d even after compaction (file %d bytes, live %d bytes)",
+			ErrDiskFull, writeSize, db.opts.MaxBytes, db.fileSize, db.liveBytes)
+	}
+	if err := db.compactLocked(); err != nil {
+		return err
+	}
+	if db.fileSize+writeSize <= limit {
+		return nil
+	}
+	return fmt.Errorf("%w: write of %d bytes does not fit in max_bytes=%d", ErrDiskFull, writeSize, db.opts.MaxBytes)
 }
 
-// rollback truncates the file to the given size.
-// Should be called when a write fails partway through.
-// Caller must hold write lock.
-func (db *DB) rollback(size int64) {
-	_ = db.file.Truncate(size)
+// maybeAutoCompact implements step 11: compact when the dead bytes exceed
+// max(CompactMinBytes, liveBytes). That bounds the log to about
+// 2 x live + CompactMinBytes, which bounds recovery time.
+func (db *DB) maybeAutoCompact() {
+	if db.opts.CompactMinBytes < 0 {
+		return
+	}
+	reclaimable := db.fileSize - HeaderSize - db.liveBytes
+	floor := db.opts.CompactMinBytes
+	if db.liveBytes > floor {
+		floor = db.liveBytes
+	}
+	if reclaimable > floor {
+		if err := db.compactLocked(); err != nil {
+			db.trace("compact-failed " + err.Error())
+		}
+	}
 }
-
-// batchIDBytes encodes a uint64 as little-endian bytes.
-func batchIDBytes(id uint64) []byte {
-	b := make([]byte, 8)
-	binary.LittleEndian.PutUint64(b, id)
-	return b
-}
-

@@ -20,6 +20,13 @@ This file records every prompt sent to AI tools during this project, in chronolo
 
 ---
 
+**Tool:** Antigravity (Gemini)  
+**Time:** 2026-11-06 ~20:36 IST
+
+> "now i have merged my branch intall with shamaz , i want u to integrate it and make sure everything is working and finalized"
+
+---
+
 ## Notes
 
 The AI was used to:
