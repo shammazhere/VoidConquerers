@@ -74,6 +74,10 @@ func main() {
 	}
 	defer oracle.Close()
 
+	if mode == ModeD2SameKey {
+		oracle.SetAllowSameKeyInFlight(true)
+	}
+
 	rng := rand.New(rand.NewSource(*seed))
 
 	passedCount := 0
@@ -198,8 +202,16 @@ func main() {
 		var verifyErr error
 		if mode == ModeD2SameKey {
 			// In D2 mode: verify using VerifyD2
-			lastVal := []byte(fmt.Sprintf("w1_iter%d_1", iter))
-			verifyErr = VerifyD2(dump, "d2_shared_contested_key", lastVal, nil)
+			lastVal, _ := oracle.GetLastAcked("d2_shared_contested_key")
+			inFlightVals := oracle.GetInFlightValues("d2_shared_contested_key")
+			verifyErr = VerifyD2(dump, "d2_shared_contested_key", lastVal, inFlightVals)
+			if verifyErr == nil {
+				actualDumpVal, exists := dump["d2_shared_contested_key"]
+				if exists {
+					oracle.SetCommitted("d2_shared_contested_key", actualDumpVal)
+				}
+				oracle.ClearInFlight()
+			}
 		} else {
 			_, verifyErr = oracle.Verify(dump)
 		}
