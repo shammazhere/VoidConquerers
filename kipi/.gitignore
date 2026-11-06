@@ -1,0 +1,10 @@
+/kvdb
+/kvdb.exe
+/torture
+/torture.exe
+torture-work/
+*.kv
+*.lock
+*.tmp
+*.batch
+
