@@ -128,6 +128,9 @@ func StartSession(kvdbBin, dbPath string, maxBytes uint64, oracle *Oracle, workD
 			s.exitedPremature.Store(true)
 		}
 		close(s.waitDone)
+		s.laneMu.Lock()
+		s.cond.Broadcast()
+		s.laneMu.Unlock()
 	}()
 
 	return s, nil
@@ -191,11 +194,28 @@ func (s *Session) SubmitOp(op Operation) (string, error) {
 	// Step 1: Wait until keys are not in flight
 	s.laneMu.Lock()
 	for !s.oracle.CanDispatch(op) {
-		if s.exitedPremature.Load() {
+		select {
+		case <-s.waitDone:
+			s.laneMu.Unlock()
+			return "", errors.New("server process terminated")
+		default:
+		}
+		if s.killedByHarness.Load() || s.exitedPremature.Load() {
 			s.laneMu.Unlock()
 			return "", errors.New("server process terminated prematurely")
 		}
 		s.cond.Wait()
+	}
+
+	select {
+	case <-s.waitDone:
+		s.laneMu.Unlock()
+		return "", errors.New("server process terminated")
+	default:
+	}
+	if s.killedByHarness.Load() || s.exitedPremature.Load() {
+		s.laneMu.Unlock()
+		return "", errors.New("server process terminated prematurely")
 	}
 
 	// Step 2: Register with oracle before writing
@@ -254,6 +274,9 @@ func (s *Session) SubmitOp(op Operation) (string, error) {
 // InjectKill delivers SIGKILL to the child process after setting killedByHarness=true.
 func (s *Session) InjectKill() error {
 	s.killedByHarness.Store(true)
+	s.laneMu.Lock()
+	s.cond.Broadcast()
+	s.laneMu.Unlock()
 	if s.cmd.Process != nil {
 		return s.cmd.Process.Kill()
 	}

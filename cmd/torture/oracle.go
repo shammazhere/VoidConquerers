@@ -64,8 +64,9 @@ type Oracle struct {
 	inFlightLanes map[string]string    // Lane -> OpID
 	inFlightKeys  map[string]int       // Key -> reference count across in-flight ops
 	seenOpIDs     map[string]struct{}  // All OpIDs ever dispatched (for duplicate rejection)
-	logFile       *os.File             // oracle.log writer
-	logErr        error                // First sticky log write error
+	logFile              *os.File             // oracle.log writer
+	logErr               error                // First sticky log write error
+	allowSameKeyInFlight bool                 // Allow same key concurrently in-flight (for scenario D2)
 }
 
 // NewOracle creates or opens an independent oracle instance.
@@ -149,10 +150,17 @@ func (o *Oracle) Close() error {
 	return firstErr
 }
 
+// SetAllowSameKeyInFlight toggles key-disjoint enforcement (disabled for scenario D2).
+func (o *Oracle) SetAllowSameKeyInFlight(allow bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.allowSameKeyInFlight = allow
+}
+
 // CanDispatch checks whether an operation can be dispatched:
 // 1. Lane must not have an active in-flight operation.
 // 2. Total in-flight count must be < W.
-// 3. None of its keys may intersect currently in-flight keys.
+// 3. None of its keys may intersect currently in-flight keys (unless allowSameKeyInFlight is set).
 func (o *Oracle) CanDispatch(op Operation) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -163,9 +171,11 @@ func (o *Oracle) CanDispatch(op Operation) bool {
 	if len(o.inFlight) >= o.maxInFlight {
 		return false
 	}
-	for _, k := range op.Keys() {
-		if o.inFlightKeys[k] > 0 {
-			return false
+	if !o.allowSameKeyInFlight {
+		for _, k := range op.Keys() {
+			if o.inFlightKeys[k] > 0 {
+				return false
+			}
 		}
 	}
 	return true
@@ -222,10 +232,12 @@ func (o *Oracle) Dispatch(op Operation) error {
 		}
 	}
 
-	// Validate Key Disjointness against currently in-flight keys
-	for _, k := range op.Keys() {
-		if o.inFlightKeys[k] > 0 {
-			return fmt.Errorf("key %q already in flight (disjoint violation)", k)
+	// Validate Key Disjointness against currently in-flight keys (unless in D2 mode)
+	if !o.allowSameKeyInFlight {
+		for _, k := range op.Keys() {
+			if o.inFlightKeys[k] > 0 {
+				return fmt.Errorf("key %q already in flight (disjoint violation)", k)
+			}
 		}
 	}
 
@@ -509,6 +521,62 @@ func (o *Oracle) Verify(dump map[string][]byte) (*VerifyResult, error) {
 		DroppedOps:       winner.droppedOps,
 		TotalKeys:        len(dump),
 	}, nil
+}
+
+// GetLastAcked returns the last acknowledged value for a key (or nil if deleted or not yet set).
+func (o *Oracle) GetLastAcked(key string) ([]byte, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	val, ok := o.committed[key]
+	if !ok {
+		return nil, false
+	}
+	res := make([]byte, len(val))
+	copy(res, val)
+	return res, true
+}
+
+// GetInFlightValues returns a slice of values (or nil for DEL) currently in flight for the given key.
+func (o *Oracle) GetInFlightValues(key string) [][]byte {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	var vals [][]byte
+	for _, op := range o.inFlight {
+		for _, item := range op.Items {
+			if item.Key == key {
+				if item.IsDel {
+					vals = append(vals, nil)
+				} else {
+					valCopy := make([]byte, len(item.Val))
+					copy(valCopy, item.Val)
+					vals = append(vals, valCopy)
+				}
+			}
+		}
+	}
+	return vals
+}
+
+// SetCommitted updates the oracle's committed value for a key.
+func (o *Oracle) SetCommitted(key string, val []byte) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if val == nil {
+		delete(o.committed, key)
+	} else {
+		valCopy := make([]byte, len(val))
+		copy(valCopy, val)
+		o.committed[key] = valCopy
+	}
+}
+
+// ClearInFlight clears the in-flight state.
+func (o *Oracle) ClearInFlight() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.inFlight = make(map[string]Operation)
+	o.inFlightLanes = make(map[string]string)
+	o.inFlightKeys = make(map[string]int)
 }
 
 // VerifyD2 verifies Scenario D2:

@@ -226,7 +226,7 @@ func runDump(args []string, out io.Writer) error {
 	}
 	writer := bufio.NewWriter(out)
 	dumpErr := db.ForEachSorted(func(key, value []byte) error {
-		_, err := fmt.Fprintf(writer, "%s\t%s\n", key, value)
+		_, err := fmt.Fprintf(writer, "%s\t%s\n", escapeDumpBytes(key), escapeDumpBytes(value))
 		return err
 	})
 	flushErr := writer.Flush()
@@ -263,3 +263,28 @@ func runCheck(args []string, out io.Writer) error {
 	}
 	return nil
 }
+
+func escapeDumpBytes(b []byte) string {
+	var buf strings.Builder
+	buf.Grow(len(b))
+	for _, c := range b {
+		switch c {
+		case '\\':
+			buf.WriteString(`\\`)
+		case '\t':
+			buf.WriteString(`\t`)
+		case '\n':
+			buf.WriteString(`\n`)
+		case '\r':
+			buf.WriteString(`\r`)
+		default:
+			if c >= 0x20 && c <= 0x7E {
+				buf.WriteByte(c)
+			} else {
+				fmt.Fprintf(&buf, `\x%02x`, c)
+			}
+		}
+	}
+	return buf.String()
+}
+
