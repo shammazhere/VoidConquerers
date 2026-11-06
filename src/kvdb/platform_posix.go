@@ -1,79 +1,51 @@
 //go:build !windows
 
-// platform_posix.go — POSIX-specific: flock, directory fsync, rename.
-
 package kvdb
 
 import (
+	"fmt"
 	"os"
-	"path/filepath"
 	"syscall"
 )
 
-// lockFile acquires an exclusive flock on the named file, creating it if needed.
-func lockFile(path string) (*os.File, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
-		return nil, err
-	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		f.Close()
-		return nil, err
-	}
-	return f, nil
+// lockFile takes an exclusive, non-blocking flock on the lock file. The
+// kernel releases it when the process dies (including kill -9), so a crash
+// never leaves a stale lock.
+func lockFile(f *os.File) error {
+	return syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 }
 
-// unlockFile releases the flock.
-func unlockFile(f *os.File) {
-	syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+func unlockFile(f *os.File) error {
+	return syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 }
 
-// syncDir fsyncs the directory containing path (required after rename on Linux).
-func syncDir(path string) error {
-	dir, err := os.Open(filepath.Dir(path))
+// syncDir fsyncs a directory so a create or rename inside it is durable.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
 	if err != nil {
 		return err
 	}
-	defer dir.Close()
-	return dir.Sync()
+	defer d.Close()
+	return d.Sync()
 }
 
-// installCompacted performs the atomic rename on POSIX:
-//  1. Close the tmp file descriptor (keep the file).
-//  2. Rename tmp → db path (atomic).
-//  3. fsync the directory.
-//  4. Reopen the renamed file for reading/writing.
-//  5. Return the new file descriptor and new file size.
-func installCompacted(tmp *os.File, tmpPath, dbPath string, oldFile *os.File, lockFile *os.File) (*os.File, int64, error) {
-	// Get size before closing
-	fi, err := tmp.Stat()
-	if err != nil {
-		return nil, 0, err
+// installCompacted is compaction steps 6 and 7 on POSIX.
+// rename(2) atomically replaces db.kv with db.tmp. The open descriptor of
+// db.tmp now refers to the file named db.kv, so it simply becomes the
+// database's descriptor: the main file is never reopened.
+func (db *DB) installCompacted(tmp *os.File) error {
+	if err := os.Rename(db.tmpPath, db.path); err != nil {
+		tmp.Close()
+		os.Remove(db.tmpPath)
+		db.trace("compact-aborted")
+		return fmt.Errorf("%w: rename: %v", ErrIO, err)
 	}
-	newSize := fi.Size()
-
-	// Close old data file descriptor
-	if err := oldFile.Close(); err != nil {
-		return nil, 0, err
+	if sabotage == "compact-old-fd" { // planted bug, dead code in normal builds
+		tmp.Close()
+		return nil
 	}
-
-	// Rename tmp → db  (CP12: atomic rename)
-	if err := os.Rename(tmpPath, dbPath); err != nil {
-		return nil, 0, err
-	}
-
-	// fsync directory (CP13)
-	if err := syncDir(dbPath); err != nil {
-		// Not fatal — rename is already durable on most POSIX systems
-		_ = err
-	}
-
-	// Reopen the file
-	newFile, err := os.OpenFile(dbPath, os.O_RDWR, 0644)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	return newFile, newSize, nil
+	old := db.f
+	db.f = tmp
+	old.Close() // its inode is now unlinked; nothing writes to it again
+	return nil
 }
-

@@ -75,15 +75,15 @@ func runGet(args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	value, getErr := db.Get([]byte(pos[1]))
+	value, found, getErr := db.Get([]byte(pos[1]))
 	closeErr := db.Close()
-	if getErr != nil && !errors.Is(getErr, kvdb.ErrNotFound) {
+	if getErr != nil {
 		return getErr
 	}
 	if closeErr != nil {
 		return fmt.Errorf("close database: %w", closeErr)
 	}
-	if errors.Is(getErr, kvdb.ErrNotFound) {
+	if !found {
 		_, err = fmt.Fprintln(out, "NOTFOUND")
 		return err
 	}
@@ -189,12 +189,12 @@ func parseBatchOperation(line string) (kvdb.Op, error) {
 		if value == "" {
 			return kvdb.Op{}, errors.New("put requires a value")
 		}
-		return kvdb.Op{Type: kvdb.OpPut, Key: []byte(key), Value: []byte(value)}, nil
+		return kvdb.Op{Del: false, Type: kvdb.OpPut, Key: []byte(key), Value: []byte(value)}, nil
 	case "del":
 		if !ok || key == "" || strings.TrimSpace(value) != "" {
 			return kvdb.Op{}, errors.New("del requires exactly one key")
 		}
-		return kvdb.Op{Type: kvdb.OpDelete, Key: []byte(key)}, nil
+		return kvdb.Op{Del: true, Type: kvdb.OpDelete, Key: []byte(key)}, nil
 	default:
 		return kvdb.Op{}, fmt.Errorf("unknown operation %q (expected put or del)", command)
 	}
@@ -251,15 +251,19 @@ func runCheck(args []string, out io.Writer) error {
 	if len(pos) != 1 {
 		return errors.New("usage: kvdb check <path>")
 	}
-	result, err := kvdb.Check(pos[0])
-	if err != nil {
-		return err
+	report := kvdb.Check(pos[0])
+	if !report.OK {
+		reason := report.Reason
+		if reason == "" {
+			reason = "corrupted database"
+		}
+		fmt.Fprintln(out, reason)
+		return errors.New("integrity check failed: " + reason)
 	}
-	if _, err := fmt.Fprintln(out, result.Message); err != nil {
-		return err
-	}
-	if !result.OK {
-		return errors.New("integrity check failed: " + result.Message)
+	if report.TailBytes > 0 {
+		fmt.Fprintf(out, "OK (uncommitted tail: %d bytes; will be truncated on open)\n", report.TailBytes)
+	} else {
+		fmt.Fprintln(out, "OK")
 	}
 	return nil
 }

@@ -1,143 +1,163 @@
-// format.go — on-disk encoding and decoding for KIPI records.
+// Package kvdb is a single-file, crash-safe key-value store.
 //
-// On-disk layout (append-only log):
+// On-disk layout (all integers little-endian):
 //
-//   File header (16 bytes):
-//     [0:4]   magic   "KIPI"
-//     [4:8]   version uint32 LE = 1
-//     [8:16]  reserved (zeros)
+//	File   = Header(16 B) | Record | Record | ...        (append-only)
+//	Header = "KIPI"(4) | Version u16 = 1 | Flags u16 = 0 | Reserved u64 = 0
+//	Record = CRC32C u32 | ValLen u32 | KeyLen u16 | Flags u8 | Pad u8 | Key | Value
 //
-//   Each record (12-byte header + payload):
-//     [0:1]   recType  uint8  (typeRecord=1, typeDelete=2, typeMarker=3)
-//     [1:5]   keyLen   uint32 LE
-//     [5:9]   valLen   uint32 LE  (0 for delete / marker)
-//     [9:13]  crc32c   uint32 LE  — CRC32C of (recType||keyLen||valLen||key||val)
-//     [13:]   key bytes
-//     [13+keyLen:] value bytes
-//
-//   Commit marker record:
-//     recType = typeMarker, keyLen = 8, valLen = 0
-//     key bytes = batchID uint64 LE
-//     crc32c covers the above
-//
-// A batch is "committed" only when its marker record is fully written AND fsynced.
-// Recovery scans from the start and collects committed batches only.
-
+// CRC32C (Castagnoli) covers record bytes 4..end (ValLen, KeyLen, Flags, Pad,
+// Key, Value). A commit marker is a 12-byte record with Flags = 0x08,
+// KeyLen = 0 and ValLen = number of data records it commits. It has no payload.
 package kvdb
 
 import (
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"hash/crc32"
 )
 
-// Record types
 const (
-	typeRecord uint8 = 1
-	typeDelete uint8 = 2
-	typeMarker uint8 = 3
+	HeaderSize  = 16
+	RecHdrSize  = 12
+	MaxKeyLen   = 1024
+	MaxValLen   = 1 << 20 // 1 MiB
+	MaxBatchOps = 10000
+	Version     = 1
+
+	FlagPut    = 0x01
+	FlagDel    = 0x02
+	FlagBatch  = 0x04 // set on every data record: "belongs to the batch the next marker commits"
+	FlagMarker = 0x08
 )
 
-// Sizes
-const (
-	FileHeaderSize = 16
-	RecHeaderSize  = 13 // recType(1) + keyLen(4) + valLen(4) + crc32c(4)
-)
+var magic = [4]byte{'K', 'I', 'P', 'I'}
 
-// File magic
-var fileMagic = [4]byte{'K', 'I', 'P', 'I'}
+var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
-// crcTable uses Castagnoli polynomial (CRC32C).
-var crcTable = crc32.MakeTable(crc32.Castagnoli)
+// ErrCorrupt means the file is not a file this database produced (bad
+// header) or a committed record failed verification.
+var ErrCorrupt = errors.New("CORRUPT")
 
-// crc32c computes a CRC32C checksum over data.
-func crc32c(data []byte) uint32 {
-	return crc32.Checksum(data, crcTable)
+func encodeHeader() []byte {
+	b := make([]byte, HeaderSize)
+	copy(b[0:4], magic[:])
+	binary.LittleEndian.PutUint16(b[4:6], Version)
+	// b[6:8] flags = 0, b[8:16] reserved = 0
+	return b
 }
 
-// encodeFileHeader returns the 16-byte file header.
-func encodeFileHeader() []byte {
-	buf := make([]byte, FileHeaderSize)
-	copy(buf[0:4], fileMagic[:])
-	binary.LittleEndian.PutUint32(buf[4:8], 1) // version
-	return buf
-}
-
-// verifyFileHeader returns true if buf starts with a valid KIPI header.
-func verifyFileHeader(buf []byte) bool {
-	if len(buf) < FileHeaderSize {
-		return false
+func checkHeader(b []byte) error {
+	if len(b) < HeaderSize {
+		return fmt.Errorf("%w: file shorter than the 16-byte header", ErrCorrupt)
 	}
-	if buf[0] != 'K' || buf[1] != 'I' || buf[2] != 'P' || buf[3] != 'I' {
-		return false
+	if b[0] != magic[0] || b[1] != magic[1] || b[2] != magic[2] || b[3] != magic[3] {
+		return fmt.Errorf("%w: bad magic (not a KIPI file)", ErrCorrupt)
 	}
-	ver := binary.LittleEndian.Uint32(buf[4:8])
-	return ver == 1
+	if v := binary.LittleEndian.Uint16(b[4:6]); v != Version {
+		return fmt.Errorf("%w: unsupported version", ErrCorrupt)
+	}
+	return nil
 }
 
-// appendRecord encodes a put/delete record and appends it to dst.
-// For deletes, val must be nil/empty and rtype must be typeDelete.
-func appendRecord(dst []byte, rtype uint8, key, val []byte) []byte {
-	kl := uint32(len(key))
-	vl := uint32(len(val))
-
-	// Compute CRC over header fields + key + val
-	crcBuf := make([]byte, 1+4+4+int(kl)+int(vl))
-	crcBuf[0] = rtype
-	binary.LittleEndian.PutUint32(crcBuf[1:5], kl)
-	binary.LittleEndian.PutUint32(crcBuf[5:9], vl)
-	copy(crcBuf[9:9+kl], key)
-	copy(crcBuf[9+kl:], val)
-	crc := crc32c(crcBuf)
-
-	hdr := make([]byte, RecHeaderSize)
-	hdr[0] = rtype
-	binary.LittleEndian.PutUint32(hdr[1:5], kl)
-	binary.LittleEndian.PutUint32(hdr[5:9], vl)
-	binary.LittleEndian.PutUint32(hdr[9:13], crc)
-
-	dst = append(dst, hdr...)
+// appendRecord appends one data record (PUT or DEL) to dst and returns it.
+// The CRC is computed last, over bytes 4..end of the record.
+func appendRecord(dst []byte, flags byte, key, val []byte) []byte {
+	start := len(dst)
+	var h [RecHdrSize]byte
+	binary.LittleEndian.PutUint32(h[4:8], uint32(len(val)))
+	binary.LittleEndian.PutUint16(h[8:10], uint16(len(key)))
+	h[10] = flags
+	h[11] = 0
+	dst = append(dst, h[:]...)
 	dst = append(dst, key...)
 	dst = append(dst, val...)
+	crc := crc32.Checksum(dst[start+4:], castagnoli)
+	binary.LittleEndian.PutUint32(dst[start:start+4], crc)
 	return dst
 }
 
-// encodeMarker returns the commit-marker record for a given batchID.
-func encodeMarker(batchID uint64) []byte {
-	key := make([]byte, 8)
-	binary.LittleEndian.PutUint64(key, batchID)
-	return appendRecord(nil, typeMarker, key, nil)
+// encodeMarker returns the 12-byte commit marker for a batch of n records.
+func encodeMarker(n int) []byte {
+	h := make([]byte, RecHdrSize)
+	binary.LittleEndian.PutUint32(h[4:8], uint32(n))
+	binary.LittleEndian.PutUint16(h[8:10], 0)
+	h[10] = FlagMarker
+	h[11] = 0
+	binary.LittleEndian.PutUint32(h[0:4], crc32.Checksum(h[4:], castagnoli))
+	return h
 }
 
-// payloadLen returns the total byte length of a record given the parsed header.
-func payloadLen(keyLen, valLen uint32) int64 {
-	return int64(RecHeaderSize) + int64(keyLen) + int64(valLen)
+type recHdr struct {
+	crc   uint32
+	vlen  uint32
+	klen  uint16
+	flags byte
+	pad   byte
 }
 
-// verifyPut checks CRC for a fully-read record.
-// rtype, key, val must all be provided as read from disk.
-func verifyPut(rtype uint8, key, val []byte) bool {
-	kl := uint32(len(key))
-	vl := uint32(len(val))
-	crcBuf := make([]byte, 1+4+4+int(kl)+int(vl))
-	crcBuf[0] = rtype
-	binary.LittleEndian.PutUint32(crcBuf[1:5], kl)
-	binary.LittleEndian.PutUint32(crcBuf[5:9], vl)
-	copy(crcBuf[9:9+kl], key)
-	copy(crcBuf[9+kl:], val)
-	return crc32c(crcBuf) == 0 // placeholder; real check below
+func parseRecHdr(b []byte) recHdr {
+	return recHdr{
+		crc:   binary.LittleEndian.Uint32(b[0:4]),
+		vlen:  binary.LittleEndian.Uint32(b[4:8]),
+		klen:  binary.LittleEndian.Uint16(b[8:10]),
+		flags: b[10],
+		pad:   b[11],
+	}
 }
 
-// verifyRecord checks the CRC of a fully-read record.
-// storedCRC is the crc field read from the header.
-func verifyRecord(rtype uint8, key, val []byte, storedCRC uint32) bool {
-	kl := uint32(len(key))
-	vl := uint32(len(val))
-	crcBuf := make([]byte, 1+4+4+int(kl)+int(vl))
-	crcBuf[0] = rtype
-	binary.LittleEndian.PutUint32(crcBuf[1:5], kl)
-	binary.LittleEndian.PutUint32(crcBuf[5:9], vl)
-	copy(crcBuf[9:9+kl], key)
-	copy(crcBuf[9+kl:], val)
-	return crc32c(crcBuf) == storedCRC
+// payloadLen validates the header fields BEFORE any payload is read (so a
+// torn or garbage length can never cause a huge allocation) and returns how
+// many bytes follow the 12-byte header. ok=false means "not a valid record".
+func (h recHdr) payloadLen() (n int, ok bool) {
+	if h.pad != 0 {
+		return 0, false
+	}
+	switch h.flags {
+	case FlagPut | FlagBatch:
+		if h.klen < 1 || h.klen > MaxKeyLen || h.vlen > MaxValLen {
+			return 0, false
+		}
+		return int(h.klen) + int(h.vlen), true
+	case FlagDel | FlagBatch:
+		if h.klen < 1 || h.klen > MaxKeyLen || h.vlen != 0 {
+			return 0, false
+		}
+		return int(h.klen), true
+	case FlagMarker:
+		if h.klen != 0 {
+			return 0, false
+		}
+		return 0, true // ValLen is the op count, there is no payload
+	default:
+		return 0, false
+	}
 }
 
+// recordCRC computes the CRC of a record from its 12-byte header and payload.
+func recordCRC(hdr, payload []byte) uint32 {
+	c := crc32.Update(0, castagnoli, hdr[4:RecHdrSize])
+	return crc32.Update(c, castagnoli, payload)
+}
+
+// verifyPut checks a whole PUT record read back from disk (used by Get,
+// Check and Compact). It returns the value slice.
+func verifyPut(rec []byte, key string) ([]byte, error) {
+	if len(rec) < RecHdrSize {
+		return nil, ErrCorrupt
+	}
+	h := parseRecHdr(rec)
+	n, ok := h.payloadLen()
+	if !ok || h.flags != FlagPut|FlagBatch || RecHdrSize+n != len(rec) {
+		return nil, ErrCorrupt
+	}
+	if recordCRC(rec[:RecHdrSize], rec[RecHdrSize:]) != h.crc {
+		return nil, ErrCorrupt
+	}
+	k := rec[RecHdrSize : RecHdrSize+int(h.klen)]
+	if string(k) != key {
+		return nil, ErrCorrupt
+	}
+	return rec[RecHdrSize+int(h.klen):], nil
+}
