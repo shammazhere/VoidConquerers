@@ -17,8 +17,8 @@ Requires Go 1.21 or newer. The module path is `kipi`, and teammates import the e
 | File | Lines | What it does |
 |---|---|---|
 | `format.go` | 163 | The bytes on disk: 16-byte header, 12-byte record header, commit marker, CRC32C. It checks lengths *before* reading a payload. |
-| `db.go` | 210 | The `DB` struct (index, fileSize, liveBytes, RWMutex, poisoned), `Options`, error codes, `Get`, `ForEachSorted`, `Stats`, `Close`. |
-| `write.go` | 303 | The only write path, `Apply`, steps 1–12: validate, disk-full guard, pwrite records, fsync, pwrite marker, fsync, index, ACK, auto-compact. It also has the rollback logic. Crash points CP1–CP7. |
+| `db.go` | 230 | The `DB` struct (index, fileSize, liveBytes, RWMutex, poisoned), `Options`, error codes, `Get`, `ForEachSorted`, `Stats`, `Close`. |
+| `write.go` | 308 | The only write path, `Apply`, steps 1–12: validate, disk-full guard, pwrite records, fsync, pwrite marker, fsync, index, ACK, auto-compact. It also has the rollback logic. Crash points CP1–CP7. |
 | `recovery.go` | 348 | `Open`: lock first, create or clean the temp file, scan, truncate the torn tail. Also the corruption guard (`markerAfter`). Crash points CP8–CP10, CP14. |
 | `compact.go` | 145 | Compaction: write live records to `db.kv.tmp`, fsync, rename over `db.kv`, update the index, fsync the directory. Crash points CP11–CP13. |
 | `check.go` | 84 | Read-only verification (`kvdb check`). |
@@ -70,7 +70,7 @@ err  = db.Close()
 | Option | Meaning |
 |---|---|
 | `MaxBytes` | File cap. 0 means unlimited. |
-| `CompactMinBytes` | Auto-compaction floor. 0 means 64 MiB; negative turns it off. |
+| `CompactMinBytes` | Auto-compaction floor: compact when dead > max(floor, live), or when the database is empty and the file is over 28 bytes. 0 means 1 MiB; negative turns it off. |
 | `Trace` | Phase events. |
 | `StepDelay` | Test only: widens crash windows. |
 | `CrashAt` / `CrashAfter` | Test only: kill itself at a crash point. |
@@ -91,7 +91,7 @@ err  = db.Close()
 | Disk full: clean error, still readable (E1–E5) | Whole-write size check first; 1/8 reserve for deletes; compact if that would fit | `spaceGuard` | `TestDiskFull`, `TestCompactionOverCap` |
 | 2+ concurrent writers; get never sees half a batch (D1–D4) | RWMutex: writers exclusive for the whole commit, readers shared | `DB.mu` | `TestConcurrentWriters`, `TestReaderNeverSeesHalfBatch` |
 | One process at a time; no stale lock after a kill | flock / LockFileEx (released by the OS on death); retried for up to 1 s | `platform_*.go`, `lockWithRetry` | `TestSecondOpenIsLocked` |
-| Recovery < 2 s at 1,000,000 keys | One linear scan, 8 MB buffered reader; index holds offsets only | `scan` | Measured: 405 ms at 1M keys (torture scale mode) |
+| Recovery < 2 s at 1,000,000 keys | One linear scan, 8 MB buffered reader; index holds offsets only | `scan` | Measured: 486 ms at 1,000,001 keys, killed mid-batch (`./torture --mode scale --seed 5`) |
 | Single authoritative file | `db.kv` only; `.lock` holds no data; `.tmp` exists only during create or compaction | | |
 | Never retry a failed fsync | Poison, then let recovery decide | `Apply`, `rollback` | Code inspection |
 | Bonus: bit-rot detection | A complete-but-damaged record followed by a valid marker makes open refuse instead of truncating | `markerAfter` | `TestCorruptionIsNotTruncated` |
@@ -122,7 +122,7 @@ Each row is a real self-kill at that line in `TestCrashPoints`, followed by a re
 1. **F4 (1 byte cut by hand).** The last marker is torn, so the last commit is dropped even if it was ACKed. No design can recover bytes removed by hand.
 2. **A damaged record *header*.** If the flags or lengths themselves are damaged, the record's length is unknown, so it is treated as a torn tail and truncated. Only a damaged *payload* or *CRC* is detected by the corruption guard.
 3. **Windows is cross-compiled only, not run.** Run `go test ./src/...` on the demo laptop.
-4. **Recovery time grows with log length.** 405 ms is measured with 100-byte values; 1 KB values are unmeasured.
+4. **Recovery time grows with log length.** 486 ms is measured with 64-byte values (85 MB file); much larger values are unmeasured.
 5. **Compaction stops the world and briefly needs 2× disk space.**
 6. **Puts may use only 7/8 of `MaxBytes`.** The rest is reserved for deletes.
 
@@ -131,7 +131,7 @@ Each row is a real self-kill at that line in `TestCrashPoints`, followed by a re
 - **CLI owner.** Print `ACK <id>` inside the `onCommit` callback of `db.Apply`, never after `Apply` returns. That is what makes ACK order equal commit order.
   - Optional: expose `--crash-at CPn` (sets `Options.CrashAt`) so you can demo any crash point live.
 - **Torture owner.**
-  - The oracle rule this engine guarantees: after a kill, the database equals all ACKed ops in ACK order, plus **at most one** un-ACKed op, applied whole.
+  - The oracle rule this engine guarantees: after a kill, the database equals all ACKed ops in ACK order, plus any of the un-ACKed in-flight ops (at most one per writer), each applied whole or not at all.
   - `StepDelay` widens crash windows on fast disks.
   - `go build -tags sabotage` plus `KVDB_SABOTAGE=ack-before-fsync|no-truncate|no-marker|compact-old-fd` gives the planted bugs.
-- **Docs owner.** The CP numbers above match the `// CPn - CRASH HERE` comments and `db.crashPoint("CPn")` calls in the code. BREAKING.md weakness 2 is now partly fixed by the corruption guard; see weakness 2 above.
+- **Docs owner.** The CP numbers above match the `// CPn - CRASH HERE` comments and `db.crashPoint("CPn")` calls in the code.
