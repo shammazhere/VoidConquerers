@@ -20,6 +20,7 @@ Key-Value Database Storage Engine Architecture Specification. Every step number 
 The diagram is drawn in draw.io: source `diagrams/KIPI-architecture.drawio` (3 pages), images below so it opens offline. Page 1 shows every component and the locks; page 2 the numbered write ordering (1–12) and the recovery flow with every crash point; page 3 compaction, the on-disk layout with field sizes, and the in-memory index.
 
 ![High-level architecture](diagrams/architecture-1-high-level.png)
+![Engine Low-Level Flow](diagrams/architecture-low-level.jpg)
 ![Write path and recovery](diagrams/architecture-2-write-and-recovery.png)
 ![Compaction, file format, memory](diagrams/architecture-3-compaction-format-memory.png)
 
