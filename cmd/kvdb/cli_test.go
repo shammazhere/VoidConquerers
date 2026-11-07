@@ -32,7 +32,7 @@ func TestAllCommandsAndEmptyDatabase(t *testing.T) {
 	}
 
 	code, out, errOut = invoke(t, []string{"check", path}, "")
-	if code != 0 || out != "OK\n" || errOut != "" {
+	if code != 0 || !strings.HasPrefix(out, "OK\n") || !strings.Contains(out, "0 live keys") || errOut != "" {
 		t.Fatalf("check empty db: code=%d stdout=%q stderr=%q", code, out, errOut)
 	}
 
@@ -125,7 +125,7 @@ func TestBatchAtomicityAndMaximumSize(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if code, out, stderr := invoke(t, []string{"batch", path, batchPath}, ""); code != 0 || out != fmt.Sprintf("OK: applied %d operations\n", kvdb.MaxBatchOps) || stderr != "" {
+	if code, out, stderr := invoke(t, []string{"batch", path, batchPath}, ""); code != 0 || !strings.HasPrefix(out, fmt.Sprintf("OK: applied %d operations (%d put, 0 del) in ", kvdb.MaxBatchOps, kvdb.MaxBatchOps)) || stderr != "" {
 		t.Fatalf("10k batch: code=%d stdout=%q stderr=%q", code, out, stderr)
 	}
 	db, err = kvdb.Open(path, kvdb.Options{})
@@ -157,7 +157,7 @@ func TestServeTortureProtocolAndDurableAcknowledgements(t *testing.T) {
 		"KV dump-1 second second value\n" +
 		"ACK dump-1\n" +
 		"NOTFOUND op-3\n"
-	if code != 0 || out != expected || stderr != "" {
+	if code != 0 || out != expected || !strings.Contains(stderr, "accepted (ACK) : 3 ") || !strings.Contains(stderr, "3 operations in 2 commits") {
 		t.Fatalf("serve: code=%d stdout=%q stderr=%q", code, out, stderr)
 	}
 
@@ -204,7 +204,7 @@ func TestInvalidArgumentsAndEngineFailures(t *testing.T) {
 	}
 
 	path := filepath.Join(t.TempDir(), "limited.kv")
-	if code, out, stderr := invoke(t, []string{"serve", path, "--max-bytes", "16"}, "full put key value\nexit\n"); code != 0 || out != "ERR full DISK_FULL\n" || stderr != "" {
+	if code, out, stderr := invoke(t, []string{"serve", path, "--max-bytes", "16"}, "full put key value\nexit\n"); code != 0 || out != "ERR full DISK_FULL\n" || !strings.Contains(stderr, "rejected (ERR) : 1   reasons: DISK_FULL=1") {
 		t.Fatalf("disk-full serve write: code=%d stdout=%q stderr=%q", code, out, stderr)
 	}
 	if code, out, stderr := invoke(t, []string{"put", path, strings.Repeat("k", kvdb.MaxKeyLen+1), "value"}, ""); code == 0 || out != "" || stderr == "" {

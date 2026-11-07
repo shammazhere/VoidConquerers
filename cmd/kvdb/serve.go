@@ -2,12 +2,14 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"kipi/src/kvdb"
@@ -18,6 +20,12 @@ const maxServeLineBytes = 2*kvdb.MaxValLen + 2*kvdb.MaxKeyLen + 1024
 var errLineTooLong = errors.New("input line exceeds the supported size")
 var errIncompleteBatch = errors.New("incomplete batch input")
 
+// outMu serializes every line written to stdout. Requests from different
+// lanes run concurrently, so without it two replies could interleave. The
+// ACK for a write is printed from inside the engine's commit callback, i.e.
+// while the engine's write lock is held, so ACK order == commit order.
+var outMu sync.Mutex
+
 func mapErrorCode(err error) string {
 	switch {
 	case errors.Is(err, kvdb.ErrPoisoned):
@@ -26,6 +34,12 @@ func mapErrorCode(err error) string {
 		return "DISK_FULL"
 	case errors.Is(err, kvdb.ErrLocked):
 		return "DB_LOCKED"
+	case errors.Is(err, kvdb.ErrBadRequest):
+		return "BAD_REQUEST"
+	case errors.Is(err, kvdb.ErrCorrupt):
+		return "CORRUPT"
+	case errors.Is(err, kvdb.ErrIO), errors.Is(err, kvdb.ErrClosed):
+		return "IO_ERROR"
 	default:
 		msg := strings.ToLower(err.Error())
 		if strings.Contains(msg, "too large") ||
@@ -41,13 +55,13 @@ func mapErrorCode(err error) string {
 	}
 }
 
-func runServe(args []string, stdin io.Reader, stdout io.Writer) error {
-	flags, pos, err := parseArgs(args, "max-bytes", "step-delay-us", "crash-at")
+func runServe(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	flags, pos, err := parseArgs(args, "max-bytes", "step-delay-us", "crash-at", "compact-min-bytes")
 	if err != nil {
 		return err
 	}
 	if len(pos) != 1 {
-		return errors.New("usage: kvdb serve <path> [--max-bytes N] [--step-delay-us N] [--crash-at CPn]")
+		return errors.New("usage: kvdb serve <path> [--max-bytes N] [--step-delay-us N] [--compact-min-bytes N] [--crash-at CPn]")
 	}
 	maxBytes, err := flagInt64(flags, "max-bytes")
 	if err != nil {
@@ -61,17 +75,27 @@ func runServe(args []string, stdin io.Reader, stdout io.Writer) error {
 	if stepDelayUs > maxDelayUs {
 		return errors.New("option --step-delay-us is too large")
 	}
+	compactMin, err := flagInt64(flags, "compact-min-bytes")
+	if err != nil {
+		return err
+	}
 
-	stepDelay := time.Duration(stepDelayUs) * time.Microsecond
 	db, err := kvdb.Open(pos[0], kvdb.Options{
-		MaxBytes:  maxBytes,
-		StepDelay: stepDelay,
-		CrashAt:   flags["crash-at"],
+		MaxBytes:        maxBytes,
+		StepDelay:       time.Duration(stepDelayUs) * time.Microsecond,
+		CrashAt:         flags["crash-at"],
+		CompactMinBytes: compactMin,
 	})
 	if err != nil {
 		return err
 	}
-	serveErr := serveLoop(db, bufio.NewReaderSize(stdin, 64*1024), bufio.NewWriter(stdout), stepDelay)
+	servePath = pos[0]
+	stats = &serveStats{start: time.Now(), rejected: map[string]int{}}
+	exited, serveErr := serveLoop(db, bufio.NewReaderSize(stdin, 64*1024), bufio.NewWriter(stdout))
+	if exited {
+		// EXIT typed by a person: show what this session accepted and rejected.
+		fmt.Fprint(stderr, stats.report(db))
+	}
 	closeErr := db.Close()
 	if serveErr != nil {
 		return serveErr
@@ -82,7 +106,93 @@ func runServe(args []string, stdin io.Reader, stdout io.Writer) error {
 	return nil
 }
 
-func serveLoop(db *kvdb.DB, reader *bufio.Reader, writer *bufio.Writer, stepDelay time.Duration) error {
+// laneOf returns the lane a request runs on. The part of the op-id before
+// the first '_' names the lane ("w1_iter3_7" -> "w1"). Requests in one lane
+// run in arrival order; different lanes run concurrently and really contend
+// for the engine's write lock. Op-ids without '_' ("1", "op-1") all share
+// the default lane, so commands typed by hand always run in order.
+func laneOf(opID string) string {
+	if i := strings.IndexByte(opID, '_'); i > 0 {
+		return opID[:i]
+	}
+	return ""
+}
+
+// lanes runs queued requests: one goroutine per lane.
+type lanes struct {
+	mu       sync.Mutex
+	queues   map[string]chan func() error
+	wg       sync.WaitGroup
+	errMu    sync.Mutex
+	firstErr error
+}
+
+func (l *lanes) submit(lane string, job func() error) {
+	l.mu.Lock()
+	q, ok := l.queues[lane]
+	if !ok {
+		q = make(chan func() error, 64)
+		l.queues[lane] = q
+		l.wg.Add(1)
+		go func() {
+			defer l.wg.Done()
+			for job := range q {
+				if err := job(); err != nil {
+					l.errMu.Lock()
+					if l.firstErr == nil {
+						l.firstErr = err
+					}
+					l.errMu.Unlock()
+				}
+			}
+		}()
+	}
+	l.mu.Unlock()
+	q <- job
+}
+
+// finish waits until every queued request has run and returns the first error.
+func (l *lanes) finish() error {
+	l.mu.Lock()
+	for _, q := range l.queues {
+		close(q)
+	}
+	l.mu.Unlock()
+	l.wg.Wait()
+	return l.firstErr
+}
+
+// textCommands are the command words of the text dialect. A line may start
+// with the command ("PUT 1 name Ada", as in the README) or with the op-id
+// ("1 PUT name Ada"); both are accepted.
+var textCommands = map[string]bool{"PUT": true, "DEL": true, "GET": true, "BATCH": true, "COMPACT": true, "DUMP": true, "STATS": true}
+
+const serveHelp = `# kvdb serve: one request per line. Replies: ACK <id> | VAL <id> <value> | NOTFOUND <id> | ERR <id> <CODE>
+#   PUT <id> <key> <value...>    DEL <id> <key>    GET <id> <key>
+#   BATCH <id> <n>  then n lines: "put key value" or "del key"
+#   HPUT/HDEL/HGET/HBATCH <id> ... : same with hex keys and values ("-" = empty value)
+#   COMPACT <id>   DUMP <id>   STATS <id> (accepted / rejected / timings)   HELP   EXIT
+# The op-id may also come first: "<id> PUT <key> <value>". ACK is printed only after both fsyncs.`
+
+func serveLoop(db *kvdb.DB, reader *bufio.Reader, writer *bufio.Writer) (exited bool, err error) {
+	ln := &lanes{queues: make(map[string]chan func() error)}
+	readErr := readRequests(db, reader, writer, ln, &exited)
+	laneErr := ln.finish()
+	if readErr != nil {
+		return exited, readErr
+	}
+	if laneErr != nil {
+		return exited, fmt.Errorf("serve: %w", laneErr)
+	}
+	return exited, nil
+}
+
+// readRequests parses requests (a batch includes its n op lines) and hands
+// each complete request to its lane. It returns when input ends.
+func readRequests(db *kvdb.DB, reader *bufio.Reader, writer *bufio.Writer, ln *lanes, exited *bool) error {
+	reply := func(lane, format string, args ...any) {
+		ln.submit(lane, func() error { return writeReply(writer, format, args...) })
+	}
 	for {
 		line, eof, err := readLine(reader, maxServeLineBytes)
 		if err != nil {
@@ -90,9 +200,7 @@ func serveLoop(db *kvdb.DB, reader *bufio.Reader, writer *bufio.Writer, stepDela
 				return nil
 			}
 			if errors.Is(err, errLineTooLong) {
-				if writeErr := writeReply(writer, "ERR ? %v\n", err); writeErr != nil {
-					return fmt.Errorf("write serve response: %w", writeErr)
-				}
+				reply("", "ERR ? BAD_REQUEST %v\n", err)
 				if eof {
 					return err
 				}
@@ -100,24 +208,27 @@ func serveLoop(db *kvdb.DB, reader *bufio.Reader, writer *bufio.Writer, stepDela
 			}
 			return fmt.Errorf("read serve input: %w", err)
 		}
-		if line == "" {
+		if strings.TrimSpace(line) == "" {
 			if eof {
 				return nil
 			}
 			continue
 		}
-		if stepDelay > 0 {
-			time.Sleep(stepDelay)
-		}
-		if strings.EqualFold(line, "exit") || strings.EqualFold(line, "quit") {
+		if strings.EqualFold(strings.TrimSpace(line), "exit") || strings.EqualFold(strings.TrimSpace(line), "quit") {
+			*exited = true
 			return nil
+		}
+		if strings.EqualFold(strings.TrimSpace(line), "help") {
+			reply("", "%s\n", serveHelp)
+			if eof {
+				return nil
+			}
+			continue
 		}
 
 		first, rest, ok := takeField(line)
 		if !ok {
-			if err := writeReply(writer, "ERR ? malformed line\n"); err != nil {
-				return fmt.Errorf("write serve response: %w", err)
-			}
+			reply("", "ERR ? BAD_REQUEST malformed line\n")
 			if eof {
 				return nil
 			}
@@ -125,74 +236,81 @@ func serveLoop(db *kvdb.DB, reader *bufio.Reader, writer *bufio.Writer, stepDela
 		}
 
 		var opID, command, args string
-		switch strings.ToUpper(first) {
-		case "HPUT", "HDEL", "HGET", "HBATCH":
-			command = strings.ToUpper(first)
+		up := strings.ToUpper(first)
+		switch {
+		case up == "HPUT" || up == "HDEL" || up == "HGET" || up == "HBATCH" || textCommands[up]:
+			// Command first: "PUT <id> ..." / "HPUT <id> ..."
+			command = up
 			opID, rest, ok = takeField(rest)
-			if !ok || strings.TrimSpace(opID) == "" {
-				if err := writeReply(writer, "ERR ? malformed line\n"); err != nil {
-					return fmt.Errorf("write serve response: %w", err)
-				}
-				if eof {
-					return nil
-				}
-				continue
-			}
-			args = strings.TrimLeft(rest, " \t")
 		default:
+			// Op-id first: "<id> PUT ..."
 			opID = first
 			var cmdToken string
 			cmdToken, rest, ok = takeField(rest)
-			if !ok || strings.TrimSpace(opID) == "" {
-				if err := writeReply(writer, "ERR ? malformed line\n"); err != nil {
-					return fmt.Errorf("write serve response: %w", err)
-				}
-				if eof {
-					return nil
-				}
-				continue
-			}
-			command = cmdToken
-			args = strings.TrimLeft(rest, " \t")
+			command = strings.ToUpper(cmdToken)
 		}
+		if !ok || strings.TrimSpace(opID) == "" {
+			reply("", "ERR ? BAD_REQUEST malformed line (expected: PUT <op-id> <key> <value>)\n")
+			if eof {
+				return nil
+			}
+			continue
+		}
+		args = strings.TrimLeft(rest, " \t")
+		lane := laneOf(opID)
 
-		var serveErr error
-		switch strings.ToLower(command) {
-		case "hput":
-			serveErr = serveHPUT(db, writer, opID, args)
-		case "hdel":
-			serveErr = serveHDEL(db, writer, opID, args)
-		case "hget":
-			serveErr = serveHGET(db, writer, opID, args)
-		case "hbatch":
-			serveErr, eof = serveHBATCH(db, reader, writer, opID, args, eof)
-		case "put":
-			serveErr = servePut(db, writer, opID, args)
-		case "del":
-			serveErr = serveDelete(db, writer, opID, args)
-		case "get":
-			serveErr = serveGet(db, writer, opID, args)
-		case "batch":
-			serveErr, eof = serveBatch(db, reader, writer, opID, args, eof)
-		case "compact":
+		switch command {
+		case "HPUT":
+			ln.submit(lane, func() error { return serveHPUT(db, writer, opID, args) })
+		case "HDEL":
+			ln.submit(lane, func() error { return serveHDEL(db, writer, opID, args) })
+		case "HGET":
+			ln.submit(lane, func() error { return serveHGET(db, writer, opID, args) })
+		case "PUT":
+			ln.submit(lane, func() error { return servePut(db, writer, opID, args) })
+		case "DEL":
+			ln.submit(lane, func() error { return serveDelete(db, writer, opID, args) })
+		case "GET":
+			ln.submit(lane, func() error { return serveGet(db, writer, opID, args) })
+		case "COMPACT":
 			if strings.TrimSpace(args) != "" {
-				serveErr = writeReply(writer, "ERR %s compact takes no arguments\n", opID)
-			} else if err := db.Compact(); err != nil {
-				serveErr = writeReply(writer, "ERR %s %v\n", opID, err)
-			} else {
-				serveErr = writeReply(writer, "ACK %s\n", opID)
+				reply(lane, "ERR %s BAD_REQUEST compact takes no arguments\n", opID)
+				break
 			}
-		case "dump":
+			ln.submit(lane, func() error {
+				if err := db.Compact(); err != nil {
+					return writeReply(writer, "ERR %s %s\n", opID, mapErrorCode(err))
+				}
+				return writeReply(writer, "ACK %s\n", opID)
+			})
+		case "STATS":
+			ln.submit(lane, func() error { return writeReply(writer, "%sSTATS %s\n", stats.report(db), opID) })
+		case "DUMP":
 			if strings.TrimSpace(args) != "" {
-				serveErr = writeReply(writer, "ERR %s dump takes no arguments\n", opID)
-			} else {
-				serveErr = serveDump(db, writer, opID)
+				reply(lane, "ERR %s BAD_REQUEST dump takes no arguments\n", opID)
+				break
 			}
+			ln.submit(lane, func() error { return serveDump(db, writer, opID) })
+		case "HBATCH", "BATCH":
+			// The n op lines are read here, by the reader, so the request is
+			// complete before it is handed to its lane.
+			hexMode := command == "HBATCH"
+			ops, parseErr, fatal, newEOF := readBatch(reader, args, hexMode)
+			eof = newEOF
+			if parseErr != nil {
+				msg := fmt.Sprintf("ERR %s BAD_REQUEST\n", opID)
+				if !hexMode {
+					msg = fmt.Sprintf("ERR %s %v\n", opID, parseErr)
+				}
+				reply(lane, "%s", msg)
+				if fatal {
+					return parseErr
+				}
+				break
+			}
+			ln.submit(lane, func() error { return applyBatch(db, writer, opID, ops) })
 		default:
-			serveErr = writeReply(writer, "ERR %s unknown command %q\n", opID, command)
-		}
-		if serveErr != nil {
-			return fmt.Errorf("serve operation %s: %w", opID, serveErr)
+			reply(lane, "ERR %s BAD_REQUEST unknown command %q\n", opID, command)
 		}
 		if eof {
 			return nil
@@ -215,20 +333,12 @@ func serveHPUT(db *kvdb.DB, writer *bufio.Writer, opID, args string) error {
 	}
 	var val []byte
 	if vHex != "-" {
-		var err error
 		val, err = hex.DecodeString(vHex)
 		if err != nil {
 			return writeReply(writer, "ERR %s BAD_REQUEST\n", opID)
 		}
 	}
-	var ackErr error
-	err = db.Apply([]kvdb.Op{{Key: key, Value: val}}, func() {
-		ackErr = writeReply(writer, "ACK %s\n", opID)
-	})
-	if err != nil {
-		return writeReply(writer, "ERR %s %s\n", opID, mapErrorCode(err))
-	}
-	return ackErr
+	return applyBatch(db, writer, opID, []kvdb.Op{{Key: key, Value: val}})
 }
 
 func serveHDEL(db *kvdb.DB, writer *bufio.Writer, opID, args string) error {
@@ -240,14 +350,7 @@ func serveHDEL(db *kvdb.DB, writer *bufio.Writer, opID, args string) error {
 	if err != nil {
 		return writeReply(writer, "ERR %s BAD_REQUEST\n", opID)
 	}
-	var ackErr error
-	err = db.Apply([]kvdb.Op{{Del: true, Key: key}}, func() {
-		ackErr = writeReply(writer, "ACK %s\n", opID)
-	})
-	if err != nil {
-		return writeReply(writer, "ERR %s %s\n", opID, mapErrorCode(err))
-	}
-	return ackErr
+	return applyBatch(db, writer, opID, []kvdb.Op{{Del: true, Key: key}})
 }
 
 func serveHGET(db *kvdb.DB, writer *bufio.Writer, opID, args string) error {
@@ -261,47 +364,65 @@ func serveHGET(db *kvdb.DB, writer *bufio.Writer, opID, args string) error {
 	}
 	val, found, err := db.Get(key)
 	switch {
-	case !found:
-		return writeReply(writer, "NOTFOUND %s\n", opID)
 	case err != nil:
 		return writeReply(writer, "ERR %s %s\n", opID, mapErrorCode(err))
+	case !found:
+		return writeReply(writer, "NOTFOUND %s\n", opID)
+	case len(val) == 0:
+		return writeReply(writer, "HVAL %s -\n", opID)
 	default:
-		if len(val) == 0 {
-			return writeReply(writer, "HVAL %s -\n", opID)
-		}
 		return writeReply(writer, "HVAL %s %s\n", opID, hex.EncodeToString(val))
 	}
 }
 
-func serveHBATCH(db *kvdb.DB, reader *bufio.Reader, writer *bufio.Writer, opID, args string, eof bool) (error, bool) {
+// applyBatch commits ops and prints ACK from inside the engine's commit
+// callback: after both fsyncs and the index update, under the write lock.
+func applyBatch(db *kvdb.DB, writer *bufio.Writer, opID string, ops []kvdb.Op) error {
+	var ackErr error
+	start := time.Now()
+	err := db.Apply(ops, func() {
+		stats.commit(len(ops), time.Since(start))
+		ackErr = writeReply(writer, "ACK %s\n", opID)
+	})
+	if err != nil {
+		return writeReply(writer, "ERR %s %s\n", opID, mapErrorCode(err))
+	}
+	return ackErr
+}
+
+// readBatch reads the n op lines of a BATCH/HBATCH request. fatal means the
+// input ended inside the batch, so the serve process must stop.
+func readBatch(reader *bufio.Reader, args string, hexMode bool) (ops []kvdb.Op, parseErr error, fatal, eof bool) {
 	count, err := strconv.Atoi(strings.TrimSpace(args))
-	if err != nil || count < 0 {
-		return writeReply(writer, "ERR %s BAD_REQUEST\n", opID), eof
+	if err != nil || count < 1 {
+		return nil, errors.New("batch count must be a positive integer"), false, false
 	}
 	if count > kvdb.MaxBatchOps {
-		_ = writeReply(writer, "ERR %s BAD_REQUEST\n", opID)
-		return fmt.Errorf("batch operation count %d exceeds limit %d", count, kvdb.MaxBatchOps), eof
+		return nil, fmt.Errorf("batch operation count %d exceeds limit %d", count, kvdb.MaxBatchOps), true, false
 	}
-
-	ops := make([]kvdb.Op, 0, count)
-	var parseErr error
+	ops = make([]kvdb.Op, 0, count)
 	for i := 0; i < count; i++ {
 		line, lineEOF, lineErr := readLine(reader, maxServeLineBytes)
 		eof = lineEOF
 		if errors.Is(lineErr, io.EOF) {
-			parseErr = errIncompleteBatch
-			break
+			return nil, errIncompleteBatch, true, true
 		}
 		if lineErr != nil {
 			if parseErr == nil {
 				parseErr = fmt.Errorf("batch line %d: %w", i+1, lineErr)
 			}
 			if lineEOF {
-				break
+				return nil, parseErr, true, true
 			}
 			continue
 		}
-		op, opErr := parseHexBatchOperation(line)
+		var op kvdb.Op
+		var opErr error
+		if hexMode {
+			op, opErr = parseHexBatchOperation(line)
+		} else {
+			op, opErr = parseBatchOperation(line)
+		}
 		if opErr != nil {
 			if parseErr == nil {
 				parseErr = fmt.Errorf("batch line %d: %w", i+1, opErr)
@@ -309,30 +430,14 @@ func serveHBATCH(db *kvdb.DB, reader *bufio.Reader, writer *bufio.Writer, opID, 
 		} else {
 			ops = append(ops, op)
 		}
-		if lineEOF && i != count-1 && parseErr == nil {
-			parseErr = errIncompleteBatch
-		}
 		if lineEOF && i != count-1 {
-			break
+			return nil, errIncompleteBatch, true, true
 		}
 	}
 	if parseErr != nil {
-		if err := writeReply(writer, "ERR %s BAD_REQUEST\n", opID); err != nil {
-			return err, eof
-		}
-		if errors.Is(parseErr, errIncompleteBatch) || eof {
-			return parseErr, true
-		}
-		return nil, false
+		return nil, parseErr, eof, eof
 	}
-	var ackErr error
-	err = db.Apply(ops, func() {
-		ackErr = writeReply(writer, "ACK %s\n", opID)
-	})
-	if err != nil {
-		return writeReply(writer, "ERR %s %s\n", opID, mapErrorCode(err)), eof
-	}
-	return ackErr, eof
+	return ops, nil, false, eof
 }
 
 func parseHexBatchOperation(line string) (kvdb.Op, error) {
@@ -382,14 +487,7 @@ func servePut(db *kvdb.DB, writer *bufio.Writer, opID, args string) error {
 		return writeReply(writer, "ERR %s BAD_REQUEST\n", opID)
 	}
 	value = strings.TrimLeft(value, " \t")
-	var ackErr error
-	err := db.Apply([]kvdb.Op{{Key: []byte(key), Value: []byte(value)}}, func() {
-		ackErr = writeReply(writer, "ACK %s\n", opID)
-	})
-	if err != nil {
-		return writeReply(writer, "ERR %s %s\n", opID, mapErrorCode(err))
-	}
-	return ackErr
+	return applyBatch(db, writer, opID, []kvdb.Op{{Key: []byte(key), Value: []byte(value)}})
 }
 
 func serveDelete(db *kvdb.DB, writer *bufio.Writer, opID, args string) error {
@@ -397,14 +495,7 @@ func serveDelete(db *kvdb.DB, writer *bufio.Writer, opID, args string) error {
 	if !ok || strings.TrimSpace(rest) != "" {
 		return writeReply(writer, "ERR %s BAD_REQUEST\n", opID)
 	}
-	var ackErr error
-	err := db.Apply([]kvdb.Op{{Del: true, Key: []byte(key)}}, func() {
-		ackErr = writeReply(writer, "ACK %s\n", opID)
-	})
-	if err != nil {
-		return writeReply(writer, "ERR %s %s\n", opID, mapErrorCode(err))
-	}
-	return ackErr
+	return applyBatch(db, writer, opID, []kvdb.Op{{Del: true, Key: []byte(key)}})
 }
 
 func serveGet(db *kvdb.DB, writer *bufio.Writer, opID, args string) error {
@@ -414,96 +505,37 @@ func serveGet(db *kvdb.DB, writer *bufio.Writer, opID, args string) error {
 	}
 	value, found, err := db.Get([]byte(key))
 	switch {
-	case !found:
-		return writeReply(writer, "NOTFOUND %s\n", opID)
 	case err != nil:
 		return writeReply(writer, "ERR %s %s\n", opID, mapErrorCode(err))
+	case !found:
+		return writeReply(writer, "NOTFOUND %s\n", opID)
 	default:
 		return writeReply(writer, "VAL %s %s\n", opID, value)
 	}
 }
 
-func serveBatch(db *kvdb.DB, reader *bufio.Reader, writer *bufio.Writer, opID, args string, eof bool) (error, bool) {
-	count, err := strconv.Atoi(strings.TrimSpace(args))
-	if err != nil || count < 0 {
-		return writeReply(writer, "ERR %s BAD_REQUEST\n", opID), eof
-	}
-	if count > kvdb.MaxBatchOps {
-		writeErr := writeReply(writer, "ERR %s BAD_REQUEST\n", opID)
-		if writeErr != nil {
-			return writeErr, eof
-		}
-		return fmt.Errorf("batch operation count %d exceeds limit %d", count, kvdb.MaxBatchOps), eof
-	}
-
-	ops := make([]kvdb.Op, 0, count)
-	var parseErr error
-	for i := 0; i < count; i++ {
-		line, lineEOF, lineErr := readLine(reader, maxServeLineBytes)
-		eof = lineEOF
-		if errors.Is(lineErr, io.EOF) {
-			parseErr = errIncompleteBatch
-			break
-		}
-		if lineErr != nil {
-			if parseErr == nil {
-				parseErr = fmt.Errorf("batch line %d: %w", i+1, lineErr)
-			}
-			if lineEOF {
-				break
-			}
-			continue
-		}
-		op, opErr := parseBatchOperation(line)
-		if opErr != nil {
-			if parseErr == nil {
-				parseErr = fmt.Errorf("batch line %d: %w", i+1, opErr)
-			}
-		} else {
-			ops = append(ops, op)
-		}
-		if lineEOF && i != count-1 && parseErr == nil {
-			parseErr = errIncompleteBatch
-		}
-		if lineEOF && i != count-1 {
-			break
-		}
-	}
-	if parseErr != nil {
-		if err := writeReply(writer, "ERR %s %v\n", opID, parseErr); err != nil {
-			return err, eof
-		}
-		if errors.Is(parseErr, errIncompleteBatch) || eof {
-			return parseErr, true
-		}
-		return nil, false
-	}
-	var ackErr error
-	err = db.Apply(ops, func() {
-		ackErr = writeReply(writer, "ACK %s\n", opID)
-	})
-	if err != nil {
-		return writeReply(writer, "ERR %s %s\n", opID, mapErrorCode(err)), eof
-	}
-	return ackErr, eof
-}
-
+// serveDump collects the whole dump first (under the engine's read lock) and
+// only then takes the output lock. Taking both at once could deadlock with a
+// writer that holds the engine lock while printing its ACK.
 func serveDump(db *kvdb.DB, writer *bufio.Writer, opID string) error {
+	var buf bytes.Buffer
 	err := db.ForEachSorted(func(key, value []byte) error {
-		_, err := fmt.Fprintf(writer, "KV %s %s %s\n", opID, escapeDumpBytes(key), escapeDumpBytes(value))
+		_, err := fmt.Fprintf(&buf, "KV %s %s %s\n", opID, escapeDumpBytes(key), escapeDumpBytes(value))
 		return err
 	})
 	if err != nil {
-		return err
+		return writeReply(writer, "ERR %s %s\n", opID, mapErrorCode(err))
 	}
-	if _, err := fmt.Fprintf(writer, "ACK %s\n", opID); err != nil {
-		return err
-	}
-	return writer.Flush()
+	fmt.Fprintf(&buf, "ACK %s\n", opID)
+	return writeReply(writer, "%s", buf.String())
 }
 
 func writeReply(writer *bufio.Writer, format string, args ...any) error {
-	if _, err := fmt.Fprintf(writer, format, args...); err != nil {
+	text := fmt.Sprintf(format, args...)
+	stats.countReply(text)
+	outMu.Lock()
+	defer outMu.Unlock()
+	if _, err := io.WriteString(writer, text); err != nil {
 		return err
 	}
 	return writer.Flush()
