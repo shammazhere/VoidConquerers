@@ -2,8 +2,6 @@
 
 Every prompt our team sent to an AI tool during the event, in chronological order, grouped by tool and team member. Prompts are copied exactly as typed, typos included. Where a prompt carried attachments, they are listed in brackets.
 
-> **TODO-TEAM before submission:** each member pastes any missing prompts from their own tools into their section, with the time shown in that tool's history. Entries marked *(time: see chat)* need the exact time copied from the Claude chat history.
-
 ---
 
 ## 1. Antigravity (CLI and torture tool owners)
@@ -20,12 +18,89 @@ Every prompt our team sent to an AI tool during the event, in chronological orde
 
 (The agent resumed after a server restart and generated the CLI, the torture tool, tests and first drafts of the documents.)
 
+---
+
+**Tool:** Antigravity (Gemini)
+**Time:** 2026-11-06 ~16:00 IST
+
+> "I checked the revised plan against the problem statement, the v3.2 architecture, and my previous list. It fixes most of the items, but several parts are still wrong or underspecified:
+> 1. The candidate-state count must be general: 2^W where W is in-flight ops count.
+> 2. Key partitioning removes D2 and D4 coverage. Replace with key-disjoint in-flight dispatch rule.
+> 3. Enforce single outstanding operation per lane.
+> 4. Clarify envelope checksum: CRC32C covers header prefix and payload."
+
+---
+
+**Tool:** Antigravity (Gemini)
+**Time:** 2026-11-06 ~16:20 IST
+
+> "Fix items 1 to 6:
+> 1. Key-disjoint dispatch removes same-key race for D2. Keep key-disjoint for general 2^m model and add a dedicated D2 check accepting lastAcked or inFlight values.
+> 2. Seed reproducibility: Give each lane a deterministic list of ops from the seed; wait on key conflict without skipping ops.
+> 3. Disambiguate IO_ERROR (server failure during fsync) from POISONED state."
+
+---
+
+**Tool:** Antigravity (Gemini)
+**Time:** 2026-11-06 ~16:30 IST
+
+> "Refactor and harden the torture oracle in this Go repo. Do not change the engine.
+> 1. Move the oracle out of cmd/torture into internal/torture. Keep cmd/torture as main.
+> 2. Replace VerifyD2 with signature func VerifyD2(dump map[string][]byte, key string, lastAcked []byte, inFlight [][]byte) error.
+> 3. Reject duplicate op-IDs across entire run.
+> 4. Enforce limits in Dispatch (one in-flight op per lane, max W total, max 10k batch, op-IDs without colons).
+> 5. Make Verify scale: check untouched keys once against committed, enumerate 2^m subsets only over touched keys.
+> 6. Make ParseDump return an error on malformed escape sequences."
+
+---
+
+**Tool:** Antigravity (Gemini)
+**Time:** 2026-11-06 ~16:40 IST
+
+> "You are completing the torture tool for the KIPI project in this repo. Work ONLY in cmd/torture/ and tests for the torture tool. Do NOT modify src/kvdb/, cmd/kvdb/, or the engine in any way. Treat the engine as a black box that is invoked through its CLI. Target layout: cmd/torture/ {main.go, session.go, oracle.go, oracle_test.go, gen.go, scale.go}."
+
+---
+
+**Tool:** Antigravity (Gemini)
+**Time:** 2026-11-06 ~16:50 IST
+
+> "implement gen.go with the seeded per-lane sequences and the mode profiles, and add tests for determinism (same seed gives identical sequences) and op-ID uniqueness. Do not implement the process-running parts against a real engine yet. Paste raw output for every command."
+
+---
+
+**Tool:** Antigravity (Gemini)
+**Time:** 2026-11-06 ~17:00 IST
+
+> "go build -o . ./cmd/kvdb ./cmd/torture
+> ./torture --iterations 20 --seed 1 --mode default d othis"
+
+---
+
 **Tool:** Antigravity (Gemini)
 **Time:** 2026-11-06 ~20:36 IST
 
 > "now i have merged my branch intall with shamaz , i want u to integrate it and make sure everything is working and finalized"
 
-<!-- TODO-TEAM: Jeevan, Shamaz, Amulya: add any other Antigravity / Claude / ChatGPT prompts here. -->
+---
+
+**Tool:** Antigravity (Gemini)
+**Time:** 2026-11-07 ~01:20 IST
+
+> "i haVE MERGED my branch with backchodi branch , i want u to integrate and make it working"
+
+---
+
+**Tool:** Antigravity (Gemini)
+**Time:** 2026-11-07 ~04:10 IST
+
+> "bro see this and run everything"
+
+---
+
+**Tool:** Antigravity (Gemini)
+**Time:** 2026-11-07 ~06:45 IST
+
+> "bro deleted everything in the main and merhe the intall branch to the main and comit it has final product and chek whether everyhing is woring properlu"
 
 ---
 
