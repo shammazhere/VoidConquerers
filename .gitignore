@@ -8,3 +8,5 @@ torture-work/
 *.tmp
 *.batch
 
+/kvdb-bad
+/kvdb-bad.exe
