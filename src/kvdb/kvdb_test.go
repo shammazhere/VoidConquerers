@@ -172,7 +172,7 @@ func TestTornTailEveryOffset(t *testing.T) {
 				cuts = append(cuts, c)
 			}
 			// always include the interesting edges
-			for _, c := range []int64{sizeBefore + 1, sizeBefore + RecHdrSize - 1, sizeBefore + RecHdrSize, sizeAfter - RecHdrSize - 1, sizeAfter - RecHdrSize, sizeAfter - RecHdrSize + 1, sizeAfter - 1} {
+			for _, c := range []int64{sizeBefore + 1, sizeBefore + RecHdrSize - 1, sizeBefore + RecHdrSize, sizeAfter - RecHdrSize - 1, sizeAfter - RecHdrSize, sizeAfter - RecHdrSize + 1, sizeAfter - 5, sizeAfter - 4, sizeAfter - 1} {
 				if c > sizeBefore && c < sizeAfter {
 					cuts = append(cuts, c)
 				}
@@ -181,19 +181,25 @@ func TestTornTailEveryOffset(t *testing.T) {
 			for _, c := range cuts {
 				copyPrefix(t, path, cut, c)
 				os.Remove(cut + ".lock")
+				// A cut inside the marker's last 4 bytes (constants) keeps the
+				// commit: open() rebuilds the marker. Any earlier cut loses it.
+				want, wantSize := before, sizeBefore
+				if c >= sizeAfter-4 {
+					want, wantSize = after, sizeAfter
+				}
 				d := mustOpen(t, cut, Options{})
 				got := snapshot(t, d)
 				fs := d.fileSize
 				d.Close()
-				if !equalMaps(got, before) {
-					t.Fatalf("cut at %d (of %d..%d): state %v, want %v", c, sizeBefore, sizeAfter, got, before)
+				if !equalMaps(got, want) {
+					t.Fatalf("cut at %d (of %d..%d): state %v, want %v", c, sizeBefore, sizeAfter, got, want)
 				}
-				if fs != sizeBefore || fileSize(t, cut) != sizeBefore {
-					t.Fatalf("cut at %d: file not truncated to last marker %d (got %d)", c, sizeBefore, fs)
+				if fs != wantSize || fileSize(t, cut) != wantSize {
+					t.Fatalf("cut at %d: file is %d bytes after open, want %d", c, fs, wantSize)
 				}
 				// open again: idempotent (C2)
 				d = mustOpen(t, cut, Options{})
-				if !equalMaps(snapshot(t, d), before) || d.RecoveryStats().TruncatedBytes != 0 {
+				if rs := d.RecoveryStats(); !equalMaps(snapshot(t, d), want) || rs.TruncatedBytes != 0 || rs.MarkerRestored != 0 {
 					t.Fatalf("second open after cut %d is not idempotent", c)
 				}
 				d.Close()
@@ -253,23 +259,42 @@ func TestUncommittedBatchDiscarded(t *testing.T) {
 	}
 }
 
-// TestTruncateOneByte is scenario F4: cut 1 byte off the end by hand.
-// open() succeeds; the last commit (here: acknowledged!) is lost because its
-// marker is now torn. This is documented as weakness 1 in BREAKING.md.
+// TestTruncateOneByte is scenario F4: cut bytes off the end by hand.
+// The file always ends in a commit marker whose last 4 bytes are constants,
+// so cutting 1-4 bytes loses nothing: open() rebuilds the marker, checks its
+// CRC and appends the missing bytes. Cutting more (the marker's count or CRC)
+// loses the last commit, and only that one.
 func TestTruncateOneByte(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "db.kv")
-	db := mustOpen(t, path, Options{})
-	db.Put([]byte("a"), []byte("1"))
-	db.Put([]byte("b"), []byte("2"))
-	db.Close()
-	if err := os.Truncate(path, fileSize(t, path)-1); err != nil {
-		t.Fatal(err)
-	}
-	db = mustOpen(t, path, Options{})
-	defer db.Close()
-	got := snapshot(t, db)
-	if !equalMaps(got, map[string]string{"a": "1"}) {
-		t.Fatalf("got %v", got)
+	for cut := int64(1); cut <= 6; cut++ {
+		path := filepath.Join(t.TempDir(), "db.kv")
+		db := mustOpen(t, path, Options{})
+		db.Put([]byte("a"), []byte("1"))
+		db.Put([]byte("b"), []byte("2"))
+		db.Close()
+		full := fileSize(t, path)
+		if err := os.Truncate(path, full-cut); err != nil {
+			t.Fatal(err)
+		}
+		if rep := Check(path); !rep.OK {
+			t.Fatalf("cut %d: check: %+v", cut, rep)
+		}
+		db = mustOpen(t, path, Options{})
+		got := snapshot(t, db)
+		rs := db.RecoveryStats()
+		db.Close()
+		if cut <= 4 {
+			if !equalMaps(got, map[string]string{"a": "1", "b": "2"}) || rs.MarkerRestored != int(cut) || fileSize(t, path) != full {
+				t.Fatalf("cut %d: got %v, restored %d, size %d (want %d)", cut, got, rs.MarkerRestored, fileSize(t, path), full)
+			}
+		} else if !equalMaps(got, map[string]string{"a": "1"}) {
+			t.Fatalf("cut %d: got %v, want only the last commit lost", cut, got)
+		}
+		// A second open finds a clean file.
+		db = mustOpen(t, path, Options{})
+		if rs := db.RecoveryStats(); rs.MarkerRestored != 0 || rs.TruncatedBytes != 0 {
+			t.Fatalf("cut %d: second open still repairing: %+v", cut, rs)
+		}
+		db.Close()
 	}
 }
 
@@ -366,6 +391,121 @@ func TestAutoCompaction(t *testing.T) {
 	if s := fileSize(t, path); s > 3*4096 {
 		t.Fatalf("file grew to %d, auto-compaction did not run", s)
 	}
+}
+
+// TestDeleteEverythingShrinks: with default options (no explicit Compact),
+// deleting every key must shrink the file to the 28-byte minimum, and the
+// file must already have shrunk partway through the deletes.
+func TestDeleteEverythingShrinks(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db.kv")
+	db := mustOpen(t, path, Options{})
+	const n, per = 50000, 5000
+	val := bytes.Repeat([]byte("v"), 40)
+	for b := 0; b < n/per; b++ {
+		ops := make([]Op, 0, per)
+		for i := b * per; i < (b+1)*per; i++ {
+			ops = append(ops, Op{Key: []byte(fmt.Sprintf("key%07d", i)), Value: val})
+		}
+		if err := db.Batch(ops); err != nil {
+			t.Fatal(err)
+		}
+	}
+	full := fileSize(t, path)
+	peak := full
+	for b := 0; b < n/per; b++ {
+		ops := make([]Op, 0, per)
+		for i := b * per; i < (b+1)*per; i++ {
+			ops = append(ops, Op{Type: OpDelete, Key: []byte(fmt.Sprintf("key%07d", i))})
+		}
+		if err := db.Batch(ops); err != nil {
+			t.Fatal(err)
+		}
+		if s := fileSize(t, path); s > peak {
+			peak = s
+		}
+	}
+	if s := fileSize(t, path); s != HeaderSize+RecHdrSize {
+		t.Fatalf("after deleting all %d keys the file is %d bytes (was %d), want %d", n, s, full, HeaderSize+RecHdrSize)
+	}
+	if peak > 2*full {
+		t.Fatalf("file grew to %d bytes during the deletes (start %d): auto-compaction did not keep up", peak, full)
+	}
+	db.Close()
+	db = mustOpen(t, path, Options{})
+	defer db.Close()
+	if db.KeyCount() != 0 {
+		t.Fatalf("reopen: %d keys, want 0", db.KeyCount())
+	}
+}
+
+// TestRejectedTailIsSavedNotApplied: an uncommitted tail is cut from the
+// database, a copy is kept for inspection, the copy is never applied, a
+// repeated recovery of the same tail does not duplicate it, and at most
+// KeepRejected copies are kept.
+func TestRejectedTailIsSavedNotApplied(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db.kv")
+	db := mustOpen(t, path, Options{})
+	if err := db.Put([]byte("city"), []byte("Delhi")); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	committed := fileSize(t, path)
+	tail := appendRecord(nil, FlagPut|FlagBatch, []byte("name"), []byte("Ada"))
+	tail = appendRecord(tail, FlagDel|FlagBatch, []byte("city"), nil) // no marker follows
+	appendTail := func(b []byte) {
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.Write(b)
+		f.Close()
+	}
+	appendTail(tail)
+	db = mustOpen(t, path, Options{})
+	rs := db.RecoveryStats()
+	if rs.RejectedFile == "" || rs.TruncatedBytes != int64(len(tail)) {
+		t.Fatalf("stats %+v: want a saved copy of %d bytes", rs, len(tail))
+	}
+	if _, ok, err := db.Get([]byte("name")); ok || err != nil {
+		t.Fatalf("uncommitted PUT was applied: %v %v", ok, err)
+	}
+	if v, ok, err := db.Get([]byte("city")); !ok || err != nil || string(v) != "Delhi" {
+		t.Fatalf("uncommitted DEL was applied: %q %v %v", v, ok, err)
+	}
+	db.Close()
+	if s := fileSize(t, path); s != committed {
+		t.Fatalf("database is %d bytes, want %d (tail cut)", s, committed)
+	}
+	info, err := ReadRejected(rs.RejectedFile)
+	if err != nil || len(info.Records) != 2 || info.Records[0].Kind != "PUT" || string(info.Records[0].Value) != "Ada" || info.Records[1].Kind != "DEL" || info.Offset != committed {
+		t.Fatalf("rejected copy: %+v %v", info, err)
+	}
+
+	// The same tail again (as if recovery had been killed before truncating):
+	// no second copy.
+	appendTail(tail)
+	db = mustOpen(t, path, Options{})
+	db.Close()
+	if files, _ := RejectedFiles(path); len(files) != 1 {
+		t.Fatalf("%d copies after recovering the same tail twice, want 1", len(files))
+	}
+
+	// Different tails: only the newest KeepRejected copies stay.
+	for i := 0; i < 5; i++ {
+		appendTail(appendRecord(nil, FlagPut|FlagBatch, []byte(fmt.Sprintf("k%d", i)), []byte("v")))
+		db = mustOpen(t, path, Options{KeepRejected: 3})
+		db.Close()
+	}
+	if files, _ := RejectedFiles(path); len(files) != 3 {
+		t.Fatalf("%d copies kept, want 3", len(files))
+	}
+	// Turned off: nothing saved, tail still cut.
+	appendTail(tail)
+	db = mustOpen(t, path, Options{KeepRejected: -1})
+	if db.RecoveryStats().RejectedFile != "" || fileSize(t, path) != committed {
+		t.Fatalf("KeepRejected=-1 saved a copy or did not cut")
+	}
+	db.Close()
 }
 
 // TestDiskFull covers E1, E2, E3, E5 at the engine level.

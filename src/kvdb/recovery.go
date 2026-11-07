@@ -19,7 +19,7 @@ import (
 func Open(path string, opts Options) (*DB, error) {
 	t0 := time.Now()
 	if opts.CompactMinBytes == 0 {
-		opts.CompactMinBytes = 64 << 20
+		opts.CompactMinBytes = 1 << 20 // 1 MiB
 	}
 	db := &DB{
 		path:     path,
@@ -68,6 +68,8 @@ func Open(path string, opts Options) (*DB, error) {
 		// 0.3 db.kv exists. A db.tmp next to it is a compaction that never
 		// completed its rename (or whose cleanup was cut short). db.kv is
 		// authoritative, so the temp file is garbage (C3, C5).
+		// A ".rejected.part" is a quarantine copy cut short by a crash.
+		_ = os.Remove(db.path + ".rejected.part")
 		if _, err := os.Stat(db.tmpPath); err == nil {
 			// CP8 - CRASH HERE (before or after the Remove, before
 			// syncDir): db.kv is authoritative; db.tmp may still exist.
@@ -104,6 +106,13 @@ func Open(path string, opts Options) (*DB, error) {
 
 	// ---- Phase 2: truncate everything after the last valid marker ----
 	if res.size > res.lastSafe && sabotage != "no-truncate" { // sabotage: planted bug, dead code in normal builds
+		// 2.0 Before cutting, keep a copy of the cut bytes for inspection
+		// (rejected.go). Best effort, never applied, never touches db.kv.
+		if saved, err := db.saveRejected(f, res.lastSafe, res.size); err == nil {
+			db.stats.RejectedFile = saved
+		} else {
+			db.trace("rejected-copy-failed " + err.Error())
+		}
 		db.trace("truncate-start")
 		db.pause()
 		if err := f.Truncate(res.lastSafe); err != nil {
@@ -120,6 +129,21 @@ func Open(path string, opts Options) (*DB, error) {
 		db.stats.TruncatedBytes = res.size - res.lastSafe
 	}
 
+	// ---- Phase 2b: complete a commit marker that lost its constant tail ----
+	// (F4). Appending the missing constant bytes is idempotent: a crash
+	// before, during or after leaves a file whose next scan completes the
+	// same marker again.
+	if len(res.markerFix) > 0 && res.lastSafe == res.size {
+		if _, err := f.WriteAt(res.markerFix, res.size); err != nil {
+			return fail(fmt.Errorf("%w: restore marker: %v", ErrIO, err))
+		}
+		if err := f.Sync(); err != nil {
+			return fail(fmt.Errorf("%w: fsync after restoring marker: %v", ErrIO, err))
+		}
+		res.lastSafe += int64(len(res.markerFix))
+		db.stats.MarkerRestored = len(res.markerFix)
+	}
+
 	// ---- Phase 3: ready ----
 	db.fileSize = res.lastSafe
 	if sabotage == "no-truncate" { // planted bug: append behind the garbage, dead code in normal builds
@@ -127,6 +151,13 @@ func Open(path string, opts Options) (*DB, error) {
 	}
 	db.stats.Keys = len(db.index)
 	db.stats.FileBytes = res.lastSafe
+	db.stats.ScannedBytes = res.size
+	db.stats.Records = res.applied
+	db.stats.Batches = res.commits
+	db.stats.Discarded = res.discarded
+	if res.size > res.lastSafe {
+		db.stats.StopReason = res.stopReason
+	}
 	db.stats.Duration = time.Since(t0)
 	db.trace("ready")
 	return db, nil
@@ -178,8 +209,15 @@ type scanResult struct {
 	lastSafe   int64  // end of the last valid commit marker (>= HeaderSize)
 	records    int    // valid data records seen (committed or not)
 	commits    int    // valid commit markers seen
+	applied    int    // data records committed by a marker (accepted)
+	discarded  int    // complete, valid data records with no marker after them (rejected)
 	stopOff    int64  // where the scan stopped
 	stopReason string // why it stopped
+	// markerFix: the file ends in a commit marker that is missing 1-4 of its
+	// last bytes. Those bytes are constants, so the marker was completed in
+	// memory, verified by its CRC and committed; markerFix holds the missing
+	// bytes, which open() appends (F4).
+	markerFix []byte
 }
 
 // scan reads the whole file once. Data records are staged; when a valid
@@ -227,6 +265,33 @@ scanLoop:
 		}
 		if err != nil {
 			if errors.Is(err, io.ErrUnexpectedEOF) {
+				// The last 4 bytes of a commit marker are always the same
+				// (KeyLen 0, Flags 0x08, Pad 0). If the file ends 8-11 bytes
+				// into a marker (its tail cut off by hand, scenario F4, or a
+				// kill while the marker was being written), complete it in
+				// memory. It counts only if its CRC verifies and its count
+				// equals the staged records, exactly like a whole marker. Its
+				// records were fsynced before the marker was written, so
+				// committing them is as safe as committing a whole marker.
+				if n >= 8 && len(pending) > 0 && sabotage != "no-marker" {
+					var full [RecHdrSize]byte
+					copy(full[:], rh[:n])
+					full[8], full[9], full[10], full[11] = 0, 0, FlagMarker, 0
+					mh := parseRecHdr(full[:])
+					if string(rh[8:n]) == string(full[8:n]) && recordCRC(full[:], nil) == mh.crc && int(mh.vlen) == len(pending) {
+						for _, p := range pending {
+							apply(p.del, p.key, p.e)
+						}
+						res.applied += len(pending)
+						pending = pending[:0]
+						res.commits++
+						res.lastSafe = off + int64(n)
+						res.markerFix = append([]byte(nil), full[n:]...)
+						off += int64(n)
+						res.stopReason = fmt.Sprintf("last commit marker was missing its last %d bytes (constants); restored", RecHdrSize-n)
+						break
+					}
+				}
 				res.stopReason = "torn record header (fewer than 12 bytes)"
 				break
 			}
@@ -298,6 +363,7 @@ scanLoop:
 			for _, p := range pending {
 				apply(p.del, p.key, p.e)
 			}
+			res.applied += len(pending)
 			pending = pending[:0]
 			res.commits++
 			res.lastSafe = off + recSize
@@ -305,6 +371,7 @@ scanLoop:
 		off += recSize
 	}
 	res.stopOff = off // offset of the first byte that is not a valid record
+	res.discarded = len(pending)
 	return res, nil
 }
 

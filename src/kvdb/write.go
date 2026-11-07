@@ -288,9 +288,15 @@ func (db *DB) spaceGuard(writeSize int64, hasPut bool) error {
 	return fmt.Errorf("%w: write of %d bytes does not fit in max_bytes=%d", ErrDiskFull, writeSize, db.opts.MaxBytes)
 }
 
-// maybeAutoCompact implements step 11: compact when the dead bytes exceed
-// max(CompactMinBytes, liveBytes). That bounds the log to about
-// 2 x live + CompactMinBytes, which bounds recovery time.
+// maybeAutoCompact implements step 11. It compacts when either
+//
+//  1. the dead bytes exceed max(CompactMinBytes, liveBytes): this bounds the
+//     log to about 2 x live + CompactMinBytes (1 MiB by default), which
+//     bounds recovery time; each compaction copies at most as many bytes as
+//     were written since the last one, so the cost per write stays constant;
+//  2. the database is empty but the file is not minimal: after "delete
+//     everything" the file shrinks to header + one marker (28 bytes) at
+//     once. Compacting an empty database copies nothing, so this is cheap.
 func (db *DB) maybeAutoCompact() {
 	if db.opts.CompactMinBytes < 0 {
 		return
@@ -300,7 +306,8 @@ func (db *DB) maybeAutoCompact() {
 	if db.liveBytes > floor {
 		floor = db.liveBytes
 	}
-	if reclaimable > floor {
+	emptyButNotMinimal := len(db.index) == 0 && db.fileSize > HeaderSize+RecHdrSize
+	if reclaimable > floor || emptyButNotMinimal {
 		if err := db.compactLocked(); err != nil {
 			db.trace("compact-failed " + err.Error())
 		}

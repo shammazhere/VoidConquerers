@@ -14,9 +14,12 @@ type CheckReport struct {
 	CommittedBytes int64  // end of the last valid commit marker
 	TailBytes      int64  // bytes after it: an uncommitted or torn tail the next open() will cut
 	TailReason     string // why the scan stopped there
-	Records        int
-	Commits        int
-	TmpExists      bool // a leftover db.tmp the next open() will delete
+	MarkerFix      int    // the last commit marker is missing this many constant bytes; open() restores them
+	Records        int    // valid data records in the file (committed or not)
+	Commits        int    // commit markers
+	Applied        int    // data records committed by a marker
+	Discarded      int    // complete records with no marker after them
+	TmpExists      bool   // a leftover db.tmp the next open() will delete
 }
 
 // Check verifies a database file without changing it (no lock, no repair).
@@ -52,6 +55,9 @@ func Check(path string) CheckReport {
 	rep.TailBytes = res.size - res.lastSafe
 	rep.Records = res.records
 	rep.Commits = res.commits
+	rep.Applied = res.applied
+	rep.Discarded = res.discarded
+	rep.MarkerFix = len(res.markerFix)
 	if rep.TailBytes > 0 {
 		rep.TailReason = res.stopReason
 	}

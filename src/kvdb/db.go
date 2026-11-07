@@ -34,8 +34,9 @@ type Options struct {
 	// can always delete (and then compact) its way out (scenario E5).
 	MaxBytes int64
 	// CompactMinBytes is the floor for automatic compaction: compact when
-	// reclaimable > max(CompactMinBytes, liveBytes). 0 means 64 MiB,
-	// negative disables automatic compaction.
+	// reclaimable > max(CompactMinBytes, liveBytes), or when the database is
+	// empty and the file is larger than 28 bytes. 0 means 1 MiB, negative
+	// disables automatic compaction.
 	CompactMinBytes int64
 	// Trace, if set, receives phase events ("scan-start", "compact-start", ...).
 	// The torture tool uses them to report where its kills landed.
@@ -50,6 +51,10 @@ type Options struct {
 	// CrashAfter skips that many hits first. Empty means never.
 	CrashAt    string
 	CrashAfter int
+	// KeepRejected is how many copies of cut, uncommitted tails recovery
+	// keeps next to the database (db.kv.rejected-*) for inspection. They are
+	// never applied. 0 means 10; negative turns the copies off.
+	KeepRejected int
 }
 
 // Op is one operation inside a batch.
@@ -78,7 +83,14 @@ type RecoveryStats struct {
 	TruncatedBytes int64 // bytes after the last valid commit marker that were cut off
 	TmpRemoved     bool  // a leftover db.tmp from a killed compaction was deleted
 	Created        bool
-	FileBytes      int64
+	FileBytes      int64  // file size after recovery
+	ScannedBytes   int64  // file size before recovery
+	Records        int    // data records accepted (committed by a marker)
+	Batches        int    // commit markers found (one per committed write or batch)
+	Discarded      int    // complete records rejected because no commit marker followed them
+	StopReason     string // why the scan stopped, if a tail was cut
+	RejectedFile   string // copy of the cut tail (inspection only), if one was saved
+	MarkerRestored int    // bytes appended to complete a commit marker cut short at the end of the file (F4)
 }
 
 // DB is an open database. All methods are safe for concurrent use.
