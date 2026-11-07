@@ -97,63 +97,93 @@ func GenerateLaneQueues(cfg GenConfig) ([]LaneQueue, error) {
 }
 
 func generateOpsForLane(rng *rand.Rand, mode Mode, laneName string, laneNum, iter, count int) ([]Operation, error) {
+	g := &LaneGen{rng: rng, mode: mode, lane: laneName, laneNum: laneNum, iter: iter, count: count}
 	ops := make([]Operation, 0, count)
-
-	keyPool := make([]string, 0, 100)
-	nextKeyID := 1
-
-	for seq := 1; seq <= count; seq++ {
-		opID := fmt.Sprintf("%s_iter%d_%d", laneName, iter, seq)
-
-		switch mode {
-		case ModeDefault, ModeRecoveryCrash:
-			op, err := genDefaultOp(rng, opID, laneName, uint64(seq), &keyPool, &nextKeyID)
-			if err != nil {
-				return nil, err
-			}
-			ops = append(ops, op)
-
-		case ModeLargeValues:
-			op, err := genLargeValueOp(rng, opID, laneName, uint64(seq), &keyPool, &nextKeyID)
-			if err != nil {
-				return nil, err
-			}
-			ops = append(ops, op)
-
-		case ModeLargeBatches:
-			op, err := genLargeBatchOp(rng, opID, laneName, uint64(seq))
-			if err != nil {
-				return nil, err
-			}
-			ops = append(ops, op)
-
-		case ModeCompaction:
-			op, err := genCompactionOp(rng, opID, laneName, uint64(seq), laneNum)
-			if err != nil {
-				return nil, err
-			}
-			ops = append(ops, op)
-
-		case ModeFullDisk:
-			op, err := genFullDiskOp(rng, opID, laneName, uint64(seq), &keyPool, &nextKeyID)
-			if err != nil {
-				return nil, err
-			}
-			ops = append(ops, op)
-
-		case ModeD2SameKey:
-			op, err := genD2SameKeyOp(rng, opID, laneName, uint64(seq))
-			if err != nil {
-				return nil, err
-			}
-			ops = append(ops, op)
-
-		default:
-			return nil, fmt.Errorf("unsupported mode %s", mode)
+	for {
+		op, ok, err := g.Next()
+		if err != nil {
+			return nil, err
 		}
+		if !ok {
+			return ops, nil
+		}
+		ops = append(ops, op)
 	}
+}
 
-	return ops, nil
+// LaneGen produces one lane's operations one at a time, in exactly the
+// order (and with exactly the content) generateOpsForLane would. The torture
+// loop generates each operation just before sending it: most iterations are
+// killed after a few operations, so building all of them up front (up to
+// 40 x 10,000 values in large-batches) was wasted work.
+type LaneGen struct {
+	rng       *rand.Rand
+	mode      Mode
+	lane      string
+	laneNum   int
+	iter      int
+	count     int
+	seq       int
+	keyPool   []string
+	nextKeyID int
+}
+
+// NewLaneGens returns one lazy generator per lane, seeded like GenerateLaneQueues.
+func NewLaneGens(cfg GenConfig) ([]*LaneGen, error) {
+	normMode, err := NormalizeMode(string(cfg.Mode))
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Lanes <= 0 {
+		return nil, errors.New("lanes must be > 0")
+	}
+	if cfg.OpsPerLane <= 0 {
+		cfg.OpsPerLane = 50
+	}
+	gens := make([]*LaneGen, cfg.Lanes)
+	for l := 0; l < cfg.Lanes; l++ {
+		laneSeed := cfg.Seed ^ int64((l+1)*7919) ^ int64(cfg.Iteration*104729)
+		gens[l] = &LaneGen{rng: rand.New(rand.NewSource(laneSeed)), mode: normMode, lane: fmt.Sprintf("w%d", l+1),
+			laneNum: l + 1, iter: cfg.Iteration, count: cfg.OpsPerLane}
+	}
+	return gens, nil
+}
+
+// Lane returns the lane name ("w1", "w2", ...).
+func (g *LaneGen) Lane() string { return g.lane }
+
+// Next returns the next operation; ok=false when the lane is finished.
+func (g *LaneGen) Next() (op Operation, ok bool, err error) {
+	if g.seq >= g.count {
+		return Operation{}, false, nil
+	}
+	if g.keyPool == nil {
+		g.keyPool = make([]string, 0, 100)
+		g.nextKeyID = 1
+	}
+	g.seq++
+	seq := g.seq
+	opID := fmt.Sprintf("%s_iter%d_%d", g.lane, g.iter, seq)
+	switch g.mode {
+	case ModeDefault, ModeRecoveryCrash:
+		op, err = genDefaultOp(g.rng, opID, g.lane, uint64(seq), &g.keyPool, &g.nextKeyID)
+	case ModeLargeValues:
+		op, err = genLargeValueOp(g.rng, opID, g.lane, uint64(seq), &g.keyPool, &g.nextKeyID)
+	case ModeLargeBatches:
+		op, err = genLargeBatchOp(g.rng, opID, g.lane, uint64(seq))
+	case ModeCompaction:
+		op, err = genCompactionOp(g.rng, opID, g.lane, uint64(seq), g.laneNum)
+	case ModeFullDisk:
+		op, err = genFullDiskOp(g.rng, opID, g.lane, uint64(seq), &g.keyPool, &g.nextKeyID)
+	case ModeD2SameKey:
+		op, err = genD2SameKeyOp(g.rng, opID, g.lane, uint64(seq))
+	default:
+		err = fmt.Errorf("unsupported mode %s", g.mode)
+	}
+	if err != nil {
+		return Operation{}, false, err
+	}
+	return op, true, nil
 }
 
 // -----------------------------------------------------------------------------
@@ -224,7 +254,10 @@ func genDefaultOp(rng *rand.Rand, opID, laneName string, seq uint64, keyPool *[]
 // large-values mode: single puts and batches with values up to 1,048,576 bytes
 func genLargeValueOp(rng *rand.Rand, opID, laneName string, seq uint64, keyPool *[]string, nextKeyID *int) (Operation, error) {
 	const oneMiB = 1048576
-	k := pickOrMakeKey(rng, keyPool, nextKeyID, laneName, 16, 64)
+	// A fixed set of 8 keys per lane, overwritten again and again: the live
+	// data stays bounded (2 lanes x 8 x 1 MiB) while the log keeps growing,
+	// so automatic compaction and recovery of big records both get exercised.
+	k := fmt.Sprintf("%s_big_%d", laneName, rng.Intn(8))
 
 	var targetLen int
 	roll := rng.Float64()
@@ -252,13 +285,13 @@ func genLargeValueOp(rng *rand.Rand, opID, laneName string, seq uint64, keyPool 
 	}, nil
 }
 
-// large-batches mode: batches of 500 to 10,000 ops
+// large-batches mode: batches of 1,000 to 10,000 ops (the PDF's maximum)
 func genLargeBatchOp(rng *rand.Rand, opID, laneName string, seq uint64) (Operation, error) {
-	batchSize := 500 + rng.Intn(1501)
+	batchSize := 1000 + rng.Intn(9001)
 	items := make([]OpItem, batchSize)
 
 	for i := 0; i < batchSize; i++ {
-		k := fmt.Sprintf("%s_b%d_k%d", laneName, seq, i+1)
+		k := fmt.Sprintf("%s_b%d_k%d", laneName, seq%4, i+1) // 4 key groups per lane, rewritten across iterations
 		subSeq := seq*10000 + uint64(i)
 		minLen := MinEnvelopeLen([]byte(k), opID, subSeq)
 		valLen := minLen + rng.Intn(16)
@@ -278,6 +311,12 @@ func genLargeBatchOp(rng *rand.Rand, opID, laneName string, seq uint64) (Operati
 
 // compaction mode: high churn on small key space (10-30 keys)
 func genCompactionOp(rng *rand.Rand, opID, laneName string, seq uint64, laneNum int) (Operation, error) {
+	// About 1 request in 8 is an explicit COMPACT, so kills land before,
+	// during and after real compactions (C3-C5). serve also runs with a small
+	// --compact-min-bytes, so automatic compactions happen as well.
+	if rng.Float64() < 0.12 {
+		return Operation{OpID: opID, Lane: laneName, Compact: true}, nil
+	}
 	keyIndex := rng.Intn(20)
 	k := fmt.Sprintf("compact_l%d_k%d", laneNum, keyIndex)
 
@@ -302,9 +341,19 @@ func genCompactionOp(rng *rand.Rand, opID, laneName string, seq uint64, laneNum 
 	}
 }
 
-// full-disk mode: rapid writes of medium values to hit --max-bytes cap
+// full-disk mode: a fixed key space (30 keys per lane) written with 4-20 KB
+// values. Live data (~700 KB) is far above the 256 KiB cap, so puts keep
+// hitting DISK_FULL (E1, E2); deletes and COMPACT requests free space, so
+// later puts must succeed again (E5).
 func genFullDiskOp(rng *rand.Rand, opID, laneName string, seq uint64, keyPool *[]string, nextKeyID *int) (Operation, error) {
-	k := pickOrMakeKey(rng, keyPool, nextKeyID, laneName, 16, 32)
+	k := fmt.Sprintf("%s_fd_%d", laneName, rng.Intn(30))
+	roll := rng.Float64()
+	switch {
+	case roll < 0.08:
+		return Operation{OpID: opID, Lane: laneName, Compact: true}, nil
+	case roll < 0.40:
+		return Operation{OpID: opID, Lane: laneName, Items: []OpItem{{Key: k, IsDel: true}}}, nil
+	}
 	minLen := MinEnvelopeLen([]byte(k), opID, seq)
 	valLen := minLen + 4096 + rng.Intn(16384) // 4KB - 20KB
 	v, err := BuildValueEnvelope([]byte(k), opID, seq, valLen, nil)
@@ -365,6 +414,9 @@ func pickOrMakeKey(rng *rand.Rand, keyPool *[]string, nextKeyID *int, laneName s
 // Batch:        HBATCH <op-id> <n>\n followed by n lines of HPUT/HDEL
 // Empty value is represented by "-".
 func FormatCommandHex(op Operation) string {
+	if op.Compact {
+		return fmt.Sprintf("COMPACT %s\n", op.OpID)
+	}
 	if len(op.Items) == 1 {
 		item := op.Items[0]
 		keyHex := hex.EncodeToString([]byte(item.Key))

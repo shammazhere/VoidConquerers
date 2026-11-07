@@ -263,3 +263,41 @@ func TestFormatCommandHex(t *testing.T) {
 	}
 }
 
+// The lazy generators used by the torture loop must produce exactly the ops
+// GenerateLaneQueues produces, so a seed still replays the same workload.
+func TestLaneGensMatchQueues(t *testing.T) {
+	for _, m := range []Mode{ModeDefault, ModeLargeValues, ModeLargeBatches, ModeCompaction, ModeFullDisk, ModeD2SameKey} {
+		cfg := GenConfig{Seed: 77, Mode: m, Lanes: 2, Iteration: 3, OpsPerLane: 6}
+		queues, err := GenerateLaneQueues(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gens, err := NewLaneGens(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for l, g := range gens {
+			for i := 0; ; i++ {
+				op, ok, err := g.Next()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !ok {
+					if i != len(queues[l].Ops) {
+						t.Fatalf("%s lane %d: %d lazy ops, %d queued", m, l, i, len(queues[l].Ops))
+					}
+					break
+				}
+				want := queues[l].Ops[i]
+				if op.OpID != want.OpID || op.Compact != want.Compact || len(op.Items) != len(want.Items) {
+					t.Fatalf("%s lane %d op %d differs", m, l, i)
+				}
+				for j := range op.Items {
+					if op.Items[j].Key != want.Items[j].Key || string(op.Items[j].Val) != string(want.Items[j].Val) || op.Items[j].IsDel != want.Items[j].IsDel {
+						t.Fatalf("%s lane %d op %d item %d differs", m, l, i, j)
+					}
+				}
+			}
+		}
+	}
+}

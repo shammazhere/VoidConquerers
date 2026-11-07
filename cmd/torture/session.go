@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -32,10 +33,15 @@ type Session struct {
 	laneWaiters map[string]chan string // lane -> response channel ("ACK" or "ERR CODE")
 	hvalCh      chan string            // channel for HVAL / VAL / NOTFOUND
 	cond        *sync.Cond
+
+	// ackErrs: oracle errors from recording ACKs in the stdout reader,
+	// handed to the lane that sent the op.
+	ackErrMu sync.Mutex
+	ackErrs  map[string]error
 }
 
 // StartSession launches ./kvdb serve <dbPath> [--max-bytes N] as a child process.
-func StartSession(kvdbBin, dbPath string, maxBytes uint64, oracle *Oracle, workDir string) (*Session, error) {
+func StartSession(kvdbBin, dbPath string, maxBytes uint64, oracle *Oracle, workDir string, extraArgs ...string) (*Session, error) {
 	if _, err := os.Stat(kvdbBin); os.IsNotExist(err) {
 		return nil, fmt.Errorf("kvdb binary not found at %q (engine is not built yet)", kvdbBin)
 	}
@@ -44,6 +50,7 @@ func StartSession(kvdbBin, dbPath string, maxBytes uint64, oracle *Oracle, workD
 	if maxBytes > 0 {
 		args = append(args, "--max-bytes", fmt.Sprintf("%d", maxBytes))
 	}
+	args = append(args, extraArgs...)
 
 	cmd := exec.Command(kvdbBin, args...)
 
@@ -148,6 +155,20 @@ func (s *Session) handleStdoutLine(line string) {
 	case "ACK":
 		if len(parts) >= 2 {
 			opID := parts[1]
+			// Record the ACK here, in the single goroutine that reads serve's
+			// stdout line by line. serve prints ACKs inside the commit, under
+			// the engine's write lock, so this order IS the commit order. If
+			// each lane recorded its own ACK after waking up, two lanes could
+			// record in the opposite order and the oracle would expect the
+			// wrong last value for a key both wrote (scenario D2).
+			if err := s.oracle.RecordAck(opID); err != nil {
+				s.ackErrMu.Lock()
+				if s.ackErrs == nil {
+					s.ackErrs = map[string]error{}
+				}
+				s.ackErrs[opID] = err
+				s.ackErrMu.Unlock()
+			}
 			lane := parseLaneFromOpID(opID)
 			s.notifyLane(lane, line)
 		}
@@ -248,7 +269,12 @@ func (s *Session) SubmitOp(op Operation) (string, error) {
 
 		parts := strings.Fields(resp)
 		if len(parts) >= 2 && parts[0] == "ACK" {
-			if err := s.oracle.RecordAck(op.OpID); err != nil {
+			// Already recorded by the stdout reader, in commit order.
+			s.ackErrMu.Lock()
+			err := s.ackErrs[op.OpID]
+			delete(s.ackErrs, op.OpID)
+			s.ackErrMu.Unlock()
+			if err != nil {
 				return resp, fmt.Errorf("oracle record ACK: %w", err)
 			}
 		} else if len(parts) >= 3 && parts[0] == "ERR" {
@@ -283,6 +309,15 @@ func (s *Session) InjectKill() error {
 	return nil
 }
 
+// CloseInput closes serve's stdin. serve then finishes every queued request
+// (including any auto-compaction that runs after the last ACK), closes the
+// database and exits normally. Use WaitShutdown afterwards.
+func (s *Session) CloseInput() error {
+	s.stdinMu.Lock()
+	defer s.stdinMu.Unlock()
+	return s.stdin.Close()
+}
+
 // WaitShutdown waits for the child process to exit with a 5-second hang guard.
 func (s *Session) WaitShutdown() error {
 	select {
@@ -303,6 +338,13 @@ func (s *Session) WaitShutdown() error {
 // RunOpen runs `./kvdb open <path> [--max-bytes N]` and measures its wall-clock duration.
 // Recovery time = wall-clock duration of the ./kvdb open process, from spawn to exit.
 func RunOpen(kvdbBin, dbPath string, maxBytes uint64) (time.Duration, error) {
+	d, _, err := RunOpenInfo(kvdbBin, dbPath, maxBytes)
+	return d, err
+}
+
+// RunOpenInfo is RunOpen that also returns what open printed (key count,
+// recovery time and any repair it did: torn tail cut, leftover tmp deleted).
+func RunOpenInfo(kvdbBin, dbPath string, maxBytes uint64) (time.Duration, string, error) {
 	args := []string{"open", dbPath}
 	if maxBytes > 0 {
 		args = append(args, "--max-bytes", fmt.Sprintf("%d", maxBytes))
@@ -318,25 +360,25 @@ func RunOpen(kvdbBin, dbPath string, maxBytes uint64) (time.Duration, error) {
 	duration := time.Since(start)
 
 	if ctx.Err() == context.DeadlineExceeded {
-		return duration, errors.New("open hang guard timeout (10s) exceeded")
+		return duration, "", errors.New("open hang guard timeout (10s) exceeded")
 	}
 	if err != nil {
-		return duration, fmt.Errorf("open failed (exit %v): %s", err, string(output))
+		return duration, string(output), fmt.Errorf("open failed (exit %v): %s", err, string(output))
 	}
-	return duration, nil
+	return duration, string(output), nil
 }
 
 // RunCheck runs `./kvdb check <path>` and asserts the output contains "OK".
 // Read-only integrity check; takes no --max-bytes.
 func RunCheck(kvdbBin, dbPath string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, kvdbBin, "check", dbPath)
 	output, err := cmd.CombinedOutput()
 
 	if ctx.Err() == context.DeadlineExceeded {
-		return errors.New("check timeout (2s) exceeded")
+		return errors.New("check timeout (60s) exceeded")
 	}
 	if err != nil {
 		return fmt.Errorf("check failed (exit %v): %s", err, string(output))
@@ -351,19 +393,18 @@ func RunCheck(kvdbBin, dbPath string) error {
 
 // RunDump runs `./kvdb dump <path>` and parses its lines via ParseDump.
 func RunDump(kvdbBin, dbPath string) (map[string][]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second) // hang guard; 1M-key dumps take a few seconds
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, kvdbBin, "dump", dbPath)
 	output, err := cmd.Output()
 
 	if ctx.Err() == context.DeadlineExceeded {
-		return nil, errors.New("dump timeout (2s) exceeded")
+		return nil, errors.New("dump timeout (60s) exceeded")
 	}
 	if err != nil {
 		return nil, fmt.Errorf("dump failed: %w", err)
 	}
 
-	return ParseDump(strings.NewReader(string(output)))
+	return ParseDump(bytes.NewReader(output))
 }
-

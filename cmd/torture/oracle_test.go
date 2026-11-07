@@ -762,4 +762,3 @@ func TestOracleNegativeCases(t *testing.T) {
 		t.Fatal("expected failure on value mismatch")
 	}
 }
-

@@ -25,6 +25,7 @@ const (
 	ErrBadRequest ServerErrorCode = "BAD_REQUEST"
 	ErrDBLocked   ServerErrorCode = "DB_LOCKED"
 	ErrIOError    ServerErrorCode = "IO_ERROR"
+	ErrCorrupt    ServerErrorCode = "CORRUPT"
 )
 
 // OpItem represents a single PUT or DEL within an operation or batch.
@@ -36,9 +37,10 @@ type OpItem struct {
 
 // Operation represents an atomic write submitted to the server (single op or batch).
 type Operation struct {
-	OpID  string
-	Lane  string
-	Items []OpItem
+	OpID    string
+	Lane    string
+	Items   []OpItem
+	Compact bool // a COMPACT request: changes no keys, only rewrites the file
 }
 
 // Keys returns the unique set of keys touched by this operation.
@@ -57,13 +59,13 @@ func (op Operation) Keys() []string {
 // Oracle maintains the independent authoritative truth of committed data
 // and verifies crash-recovery dumps against allowable in-flight states.
 type Oracle struct {
-	mu            sync.Mutex
-	maxInFlight   int                  // W: maximum allowed in-flight operations
-	committed     map[string][]byte    // Key -> Value
-	inFlight      map[string]Operation // OpID -> Operation
-	inFlightLanes map[string]string    // Lane -> OpID
-	inFlightKeys  map[string]int       // Key -> reference count across in-flight ops
-	seenOpIDs     map[string]struct{}  // All OpIDs ever dispatched (for duplicate rejection)
+	mu                   sync.Mutex
+	maxInFlight          int                  // W: maximum allowed in-flight operations
+	committed            map[string][]byte    // Key -> Value
+	inFlight             map[string]Operation // OpID -> Operation
+	inFlightLanes        map[string]string    // Lane -> OpID
+	inFlightKeys         map[string]int       // Key -> reference count across in-flight ops
+	seenOpIDs            map[string]struct{}  // All OpIDs ever dispatched (for duplicate rejection)
 	logFile              *os.File             // oracle.log writer
 	logErr               error                // First sticky log write error
 	allowSameKeyInFlight bool                 // Allow same key concurrently in-flight (for scenario D2)
@@ -215,8 +217,8 @@ func (o *Oracle) Dispatch(op Operation) error {
 		return fmt.Errorf("total in-flight limit of %d ops reached", o.maxInFlight)
 	}
 
-	// Validate Batch Items
-	if len(op.Items) == 0 {
+	// Validate Batch Items (a COMPACT request has none)
+	if len(op.Items) == 0 && !op.Compact {
 		return errors.New("batch cannot be empty")
 	}
 	if len(op.Items) > 10000 {
@@ -310,7 +312,7 @@ func (o *Oracle) RecordErr(opID string, errCode ServerErrorCode) error {
 	}
 
 	switch errCode {
-	case ErrPoisoned, ErrDiskFull, ErrBadRequest, ErrDBLocked, ErrIOError:
+	case ErrPoisoned, ErrDiskFull, ErrBadRequest, ErrDBLocked, ErrIOError, ErrCorrupt:
 		// Valid code
 	default:
 		return fmt.Errorf("unknown server error code: %q", errCode)
@@ -325,7 +327,7 @@ func (o *Oracle) RecordErr(opID string, errCode ServerErrorCode) error {
 		return err
 	}
 
-	if errCode != ErrIOError {
+	if errCode != ErrIOError && errCode != ErrCorrupt {
 		// Definitively not committed: discard from in-flight
 		delete(o.inFlightLanes, op.Lane)
 		for _, k := range op.Keys() {
@@ -340,6 +342,20 @@ func (o *Oracle) RecordErr(opID string, errCode ServerErrorCode) error {
 	return nil
 }
 
+// InFlightCount returns how many dispatched ops have had no reply yet. Called
+// after a kill, it tells whether the kill landed while an op was in flight.
+func (o *Oracle) InFlightCount() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	n := 0
+	for _, op := range o.inFlight {
+		if !op.Compact {
+			n++
+		}
+	}
+	return n
+}
+
 // VerifyResult captures the outcome of an oracle dump verification.
 type VerifyResult struct {
 	MatchedCandidate []string // OpIDs of in-flight ops that were committed in the winning candidate
@@ -350,11 +366,11 @@ type VerifyResult struct {
 // Verify checks the post-recovery dump against all 2^m allowable in-flight states.
 //
 // Scalable Verification Algorithm:
-// 1. Checks all keys not touched by any in-flight op once against `committed`.
-// 2. Enumerates 2^m subsets ONLY over keys touched by in-flight ops (without cloning full committed map).
-// 3. On failure: leaves in-flight state unchanged and returns detailed error.
-// 4. On match: selects winning candidate via deterministic tie-break, applies changes,
-//    logs resolutions, and clears in-flight state.
+//  1. Checks all keys not touched by any in-flight op once against `committed`.
+//  2. Enumerates 2^m subsets ONLY over keys touched by in-flight ops (without cloning full committed map).
+//  3. On failure: leaves in-flight state unchanged and returns detailed error.
+//  4. On match: selects winning candidate via deterministic tie-break, applies changes,
+//     logs resolutions, and clears in-flight state.
 func (o *Oracle) Verify(dump map[string][]byte) (*VerifyResult, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -613,12 +629,19 @@ func (o *Oracle) buildDiffReport(dump map[string][]byte, inFlight []Operation) s
 	b.WriteString("=== DUMP DIFF REPORT ===\n")
 	b.WriteString(fmt.Sprintf("Committed keys: %d | Dump keys: %d | In-flight ops: %d\n",
 		len(o.committed), len(dump), len(inFlight)))
+	if len(inFlight) > 0 {
+		ids := make([]string, 0, len(inFlight))
+		for _, op := range inFlight {
+			ids = append(ids, op.OpID)
+		}
+		b.WriteString("In-flight (sent, not ACKed) op IDs: " + strings.Join(ids, ", ") + "\n")
+	}
 
 	missingCount := 0
 	for k := range o.committed {
 		if _, exists := dump[k]; !exists {
 			if missingCount < 10 {
-				b.WriteString(fmt.Sprintf("MISSING KEY in dump: %s\n", k))
+				b.WriteString(fmt.Sprintf("MISSING KEY in dump: %s\n    expected: the value ACKed by op %s\n    found:    key absent\n", k, envelopeOp(o.committed[k])))
 			}
 			missingCount++
 		}
@@ -631,7 +654,7 @@ func (o *Oracle) buildDiffReport(dump map[string][]byte, inFlight []Operation) s
 	for k := range dump {
 		if _, exists := o.committed[k]; !exists {
 			if extraCount < 10 {
-				b.WriteString(fmt.Sprintf("EXTRA KEY in dump: %s (len=%d)\n", k, len(dump[k])))
+				b.WriteString(fmt.Sprintf("EXTRA KEY in dump: %s\n    expected: key absent (no ACKed write left it present)\n    found:    %d bytes written by %s\n", k, len(dump[k]), envelopeOp(dump[k])))
 			}
 			extraCount++
 		}
@@ -645,9 +668,9 @@ func (o *Oracle) buildDiffReport(dump map[string][]byte, inFlight []Operation) s
 		if dumpVal, exists := dump[k]; exists {
 			if !bytes.Equal(commVal, dumpVal) {
 				if mismatchCount < 10 {
-					b.WriteString(fmt.Sprintf("VALUE MISMATCH on key %s: expected %d bytes (CRC %08x), got %d bytes (CRC %08x)\n",
-						k, len(commVal), crc32.Checksum(commVal, castagnoliTable),
-						len(dumpVal), crc32.Checksum(dumpVal, castagnoliTable)))
+					b.WriteString(fmt.Sprintf("VALUE MISMATCH on key %s\n    expected: %d bytes (CRC %08x) ACKed by op %s\n    found:    %d bytes (CRC %08x) written by %s\n",
+						k, len(commVal), crc32.Checksum(commVal, castagnoliTable), envelopeOp(commVal),
+						len(dumpVal), crc32.Checksum(dumpVal, castagnoliTable), envelopeOp(dumpVal)))
 				}
 				mismatchCount++
 			}
@@ -659,6 +682,20 @@ func (o *Oracle) buildDiffReport(dump map[string][]byte, inFlight []Operation) s
 // -----------------------------------------------------------------------------
 // Value Envelope & CRC Validation
 // -----------------------------------------------------------------------------
+
+// envelopeOp names the operation that wrote a value, read from the value's
+// envelope ("VAL:v1:<key_hex>:<op_id>:<seq>:..."), for failure reports.
+func envelopeOp(v []byte) string {
+	head := v
+	if len(head) > 600 {
+		head = head[:600]
+	}
+	f := strings.SplitN(string(head), ":", 6)
+	if len(f) < 6 || f[0] != "VAL" || f[1] != "v1" {
+		return "nobody (not a value the torture tool wrote: garbage or torn bytes)"
+	}
+	return fmt.Sprintf("%s (seq %s)", f[3], f[4])
+}
 
 // MinEnvelopeLen calculates the minimum target length required to store an envelope
 // for a given key, opID, and seq (with a 0-byte payload).
@@ -827,28 +864,42 @@ func ParseAndVerifyEnvelope(expectedKey []byte, value []byte) (*ParsedEnvelope, 
 // Printable ASCII (0x20..0x7E, except \ and \t) emitted as-is.
 // \t -> \t, \n -> \n, \r -> \r, \\ -> \\
 // Other bytes -> \xHH
-func EscapeDumpString(b []byte) string {
-	var buf strings.Builder
-	buf.Grow(len(b))
+// appendEscaped appends b in dump notation: printable ASCII as-is, \\ \t \n \r
+// escaped, every other byte as \xHH. It works byte by byte with a lookup
+// table (no fmt call per byte), which matters for megabyte binary values.
+func appendEscaped(dst, b []byte) []byte {
+	const hexdig = "0123456789abcdef"
 	for _, c := range b {
-		switch c {
-		case '\\':
-			buf.WriteString(`\\`)
-		case '\t':
-			buf.WriteString(`\t`)
-		case '\n':
-			buf.WriteString(`\n`)
-		case '\r':
-			buf.WriteString(`\r`)
+		switch {
+		case c == '\\':
+			dst = append(dst, '\\', '\\')
+		case c == '\t':
+			dst = append(dst, '\\', 't')
+		case c == '\n':
+			dst = append(dst, '\\', 'n')
+		case c == '\r':
+			dst = append(dst, '\\', 'r')
+		case c >= 0x20 && c <= 0x7E:
+			dst = append(dst, c)
 		default:
-			if c >= 0x20 && c <= 0x7E {
-				buf.WriteByte(c)
-			} else {
-				fmt.Fprintf(&buf, `\x%02x`, c)
-			}
+			dst = append(dst, '\\', 'x', hexdig[c>>4], hexdig[c&15])
 		}
 	}
-	return buf.String()
+	return dst
+}
+
+func EscapeDumpString(b []byte) string { return string(appendEscaped(make([]byte, 0, len(b)), b)) }
+
+func unhex(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
 }
 
 // UnescapeDumpString inverts EscapeDumpString, recovering exact raw bytes.
@@ -878,11 +929,12 @@ func UnescapeDumpString(s string) ([]byte, error) {
 				if i+3 >= len(s) {
 					return nil, errors.New("truncated \\x escape sequence")
 				}
-				hexByte, err := hex.DecodeString(s[i+2 : i+4])
-				if err != nil {
-					return nil, fmt.Errorf("invalid \\xHH escape at index %d: %w", i, err)
+				hi, ok1 := unhex(s[i+2])
+				lo, ok2 := unhex(s[i+3])
+				if !ok1 || !ok2 {
+					return nil, fmt.Errorf("invalid \\xHH escape at index %d: %q", i, s[i:i+4])
 				}
-				buf.WriteByte(hexByte[0])
+				buf.WriteByte(hi<<4 | lo)
 				i += 4
 			default:
 				return nil, fmt.Errorf("unknown escape sequence \\%c at index %d", s[i+1], i)
@@ -904,7 +956,7 @@ func ParseDump(r io.Reader) (map[string][]byte, error) {
 	}
 
 	result := make(map[string][]byte)
-	lines := strings.Split(string(data), "\n")
+	lines := strings.Split(string(data), "\n") // one conversion; lines share its memory
 	for lineNum, line := range lines {
 		if line == "" {
 			continue
